@@ -7,6 +7,7 @@ import pyautogui
 import ctypes
 import shutil
 import subprocess
+import traceback
 
 
 from PIL import ImageGrab
@@ -416,12 +417,15 @@ class RegionSelectorOverlay(QWidget):
         self.start_point = None
         self.current_point = None
         self.message = "Drag to select an area. Esc cancels."
+        self._completion_emitted = False
+        self._closing = False
 
         self.setWindowFlags(
             Qt.FramelessWindowHint |
             Qt.WindowStaysOnTopHint |
             Qt.Tool
         )
+        self.setAttribute(Qt.WA_DeleteOnClose, True)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setMouseTracking(True)
         self.setCursor(Qt.CrossCursor)
@@ -434,12 +438,17 @@ class RegionSelectorOverlay(QWidget):
         self.grabKeyboard()
 
     def closeEvent(self, event):
+        self._closing = True
         if self.keyboardGrabber() is self:
             self.releaseKeyboard()
+        if not self._completion_emitted:
+            self._completion_emitted = True
+            self.selection_canceled.emit()
         super().closeEvent(event)
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape:
+            self._completion_emitted = True
             self.selection_canceled.emit()
             self.close()
             return
@@ -477,6 +486,7 @@ class RegionSelectorOverlay(QWidget):
             self.update()
             return
 
+        self._completion_emitted = True
         self.selection_made.emit(*rect)
         self.close()
 
@@ -765,29 +775,132 @@ class ScreenRecorder(QMainWindow):
             )
 
     def select_region(self):
+        self._debug_selection_state("select button handler entered")
         self.status_label.setText("📌 Выбирайте область... (ESC для отмены)")
         if self.selector_overlay and self.selector_overlay.isVisible():
+            self._debug_selection_state("existing selector is still visible")
             return
+
+        if self.selector_overlay:
+            self._dispose_selector(self.selector_overlay)
 
         self.select_btn.setEnabled(False)
         self.selector_overlay = RegionSelectorOverlay()
         self.selector_overlay.selection_made.connect(self.on_region_selected)
         self.selector_overlay.selection_canceled.connect(self.on_region_selection_canceled)
         self.selector_overlay.destroyed.connect(self.on_region_selector_closed)
+        self._debug_selection_state("selector created")
         self.selector_overlay.show_overlay()
+        self._debug_selection_state("selector shown")
 
     def on_region_selected(self, x, y, w, h):
-        self.recording_rect = (x, y, w, h)
-        self.status_label.setText(f"✅ Выбрана область: {w}×{h} пикселей. Готово к записи.")
-        self.record_btn.setEnabled(True)
+        selector = self.selector_overlay
+        self._debug_selection_state(
+            f"selection signal received: QRect({x}, {y}, {w}, {h})"
+        )
+        try:
+            self.recording_rect = (x, y, w, h)
+            self.status_label.setText(f"✅ Выбрана область: {w}×{h} пикселей. Готово к записи.")
+            self.record_btn.setEnabled(True)
+
+            if self.border_window:
+                self.border_window.close()
+                self.border_window = None
+            self.border_window = BorderWindow(self.recording_rect)
+            self.border_window.show()
+            self._debug_selection_state("selection border created and shown")
+        except Exception as exc:
+            debug_print(
+                "[selection] exception in completion callback:",
+                repr(exc),
+                traceback.format_exc(),
+            )
+            self.status_label.setText(f"Selection failed: {exc}")
+        finally:
+            self._finish_region_selection(selector)
 
     def on_region_selection_canceled(self):
-        self.status_label.setText("Selection canceled.")
-        self.record_btn.setEnabled(self.recording_rect is not None)
+        selector = self.selector_overlay
+        self._debug_selection_state("selection canceled")
+        try:
+            self.status_label.setText("Selection canceled.")
+            self.record_btn.setEnabled(self.recording_rect is not None)
+        finally:
+            self._finish_region_selection(selector)
 
     def on_region_selector_closed(self, *args):
-        self.selector_overlay = None
+        selector = self.sender()
+        debug_print("[selection] selector destroyed:", repr(selector))
+        if self.selector_overlay is selector:
+            self.selector_overlay = None
         self.select_btn.setEnabled(True)
+        self._restore_main_window_after_selection()
+
+    def _finish_region_selection(self, selector):
+        try:
+            self._dispose_selector(selector)
+        finally:
+            self._restore_main_window_after_selection()
+            self._debug_selection_state("selection completion finished")
+
+    def _dispose_selector(self, selector):
+        if selector is None:
+            return
+
+        if self.selector_overlay is selector:
+            self.selector_overlay = None
+
+        for signal, slot in (
+            (selector.selection_made, self.on_region_selected),
+            (selector.selection_canceled, self.on_region_selection_canceled),
+            (selector.destroyed, self.on_region_selector_closed),
+        ):
+            try:
+                signal.disconnect(slot)
+            except (TypeError, RuntimeError) as exc:
+                debug_print("[selection] signal disconnect skipped:", repr(exc))
+
+        try:
+            if not selector._closing:
+                selector.close()
+            selector.deleteLater()
+        except RuntimeError as exc:
+            debug_print("[selection] selector disposal failed:", repr(exc))
+
+        self.select_btn.setEnabled(not self.recording)
+        debug_print("[selection] selector closed, deleted, and disconnected")
+
+    def _restore_main_window_after_selection(self):
+        debug_print(
+            "[selection] restoring main window; before:",
+            "visible=", self.isVisible(),
+            "minimized=", self.isMinimized(),
+        )
+        self.showNormal()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        debug_print(
+            "[selection] restoring main window; after:",
+            "visible=", self.isVisible(),
+            "minimized=", self.isMinimized(),
+        )
+
+    def _debug_selection_state(self, event):
+        stopping = bool(
+            self.recorder_thread
+            and self.recorder_thread.isRunning()
+            and not self.recorder_thread.is_recording
+        )
+        debug_print(
+            f"[selection] {event};",
+            "main_visible=", self.isVisible(),
+            "main_minimized=", self.isMinimized(),
+            "recording=", self.recording,
+            "stopping=", stopping,
+            "selector=", repr(self.selector_overlay),
+            "border=", repr(self.border_window),
+        )
 
     def start_recording(self):
         # Защита от повторного старта
@@ -850,6 +963,7 @@ class ScreenRecorder(QMainWindow):
 
         # Свернуть главное окно при старте записи
         self.showMinimized()
+        self._debug_selection_state("main window minimized for recording")
 
         self.status_label.setText(
             f"⏺️ ЗАПИСЬ в процессе... {self.recording_rect[2]}×{self.recording_rect[3]}px @ {fps} FPS"
@@ -896,6 +1010,7 @@ class ScreenRecorder(QMainWindow):
         self.stop_btn.setEnabled(True)
         self.select_btn.setEnabled(True)
         self.pause_btn.setText("⏸️ Пауза")
+        self._debug_selection_state("recording finished")
 
         # Убедимся, что рамка закрыта
         if self.border_window:
