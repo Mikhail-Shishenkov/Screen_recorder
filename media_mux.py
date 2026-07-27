@@ -34,20 +34,21 @@ def build_mixed_audio_filter(system_index, microphone_index):
 
 
 def find_ffmpeg():
-    candidates = []
     bundle_dir = getattr(sys, "_MEIPASS", None)
     if bundle_dir:
-        candidates.append(Path(bundle_dir) / "ffmpeg.exe")
-    candidates.append(Path(sys.executable).resolve().parent / "ffmpeg.exe")
+        bundled = Path(bundle_dir) / "ffmpeg.exe"
+        if bundled.is_file():
+            return str(bundled)
+        raise MediaMuxError(f"Bundled FFmpeg was not found: {bundled}")
 
-    for candidate in candidates:
-        if candidate.is_file():
-            return str(candidate)
+    adjacent = Path(sys.executable).resolve().parent / "ffmpeg.exe"
+    if adjacent.is_file():
+        return str(adjacent)
 
     executable = shutil.which("ffmpeg")
     if executable:
         return executable
-    raise MediaMuxError("Bundled FFmpeg was not found")
+    raise MediaMuxError("FFmpeg was not found. Install it for development builds.")
 
 
 def build_mux_command(

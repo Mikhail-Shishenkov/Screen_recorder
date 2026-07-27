@@ -15,6 +15,7 @@ from audio_capture import (
 )
 from media_mux import (
     MIX_LIMIT,
+    MediaMuxError,
     build_mixed_audio_filter,
     build_mux_command,
     find_ffmpeg,
@@ -35,6 +36,36 @@ def make_track(source, path):
 
 
 class MediaMuxTests(unittest.TestCase):
+    def test_frozen_build_uses_bundled_ffmpeg_before_path(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            bundled = Path(temp_dir) / "ffmpeg.exe"
+            bundled.write_bytes(b"bundled")
+
+            with patch("media_mux.sys._MEIPASS", temp_dir, create=True), patch(
+                "media_mux.shutil.which", return_value=r"C:\\ffmpeg\\ffmpeg.exe"
+            ) as which_mock:
+                self.assertEqual(find_ffmpeg(), str(bundled))
+
+            which_mock.assert_not_called()
+
+    def test_frozen_build_does_not_fall_back_to_system_path(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch("media_mux.sys._MEIPASS", temp_dir, create=True), patch(
+                "media_mux.shutil.which", return_value=r"C:\\ffmpeg\\ffmpeg.exe"
+            ) as which_mock:
+                with self.assertRaisesRegex(MediaMuxError, "Bundled FFmpeg was not found"):
+                    find_ffmpeg()
+
+            which_mock.assert_not_called()
+
+    def test_development_build_can_use_path_ffmpeg(self):
+        with patch("media_mux.sys._MEIPASS", None, create=True), patch(
+            "media_mux.Path.is_file", return_value=False
+        ), patch(
+            "media_mux.shutil.which", return_value=r"C:\\ffmpeg\\ffmpeg.exe"
+        ):
+            self.assertEqual(find_ffmpeg(), r"C:\\ffmpeg\\ffmpeg.exe")
+
     def test_video_only_mux_has_no_audio_output(self):
         command = build_mux_command(
             "ffmpeg.exe",
