@@ -1,0 +1,27 @@
+# PyCharm
+.idea/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# PyInstaller
+build/
+dist/
+
+# Temporary files
+*.log
+*.tmp
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Secrets
+.env
