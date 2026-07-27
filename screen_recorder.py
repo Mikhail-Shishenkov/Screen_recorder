@@ -12,6 +12,7 @@ import traceback
 
 from PIL import ImageGrab
 import cv2
+import mss
 import numpy as np
 from PyQt5.QtGui import QMovie
 from PyQt5.QtWidgets import QDialog
@@ -20,6 +21,8 @@ from region_geometry import (
     rect_to_capture_bbox,
     rect_to_capture_region,
 )
+from frame_scheduler import FrameScheduler
+from async_frame_writer import AsyncFrameWriter
 
 
 from PyQt5.QtWidgets import (
@@ -37,7 +40,12 @@ DEBUG = False
 
 def debug_print(*args, **kwargs):
     if DEBUG:
-        print(*args, **kwargs)
+        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+        safe_args = [
+            str(arg).encode(encoding, errors="replace").decode(encoding)
+            for arg in args
+        ]
+        print(*safe_args, **kwargs)
 
 
 def enable_dpi_awareness():
@@ -133,6 +141,9 @@ class RecorderThread(QThread):
         # frames оставляем для совместимости, но не используем
         self.frames = []
         self.frame_count = 0
+        self.captured_frame_count = 0
+        self.missed_frame_count = 0
+        self.active_recording_seconds = 0.0
         self.prev_left_down = False
         self.prev_right_down = False
         self.click_anim_left = 0
@@ -166,156 +177,204 @@ class RecorderThread(QThread):
             frame = cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2BGR)
         return frame
 
-    def _measure_capture_fps(self, capture_bbox, capture_region, duration=1.0):
-        """
-        Быстренько меряем реальный FPS захвата экрана,
-        чтобы не ускорять/замедлять итоговое видео.
-        """
-        debug_print("⏱️ Калибровка FPS захвата...")
-        start = time.time()
-        frames = 0
+    def _capture_frame(self, capture_bbox, capture_region, capture_session):
+        if self.use_pyautogui_capture:
+            screenshot = pyautogui.screenshot(region=capture_region)
+            return cv2.cvtColor(np.asarray(screenshot), cv2.COLOR_RGB2BGR)
 
-        while time.time() - start < duration and self.is_recording:
-            try:
-                self._capture_frame_raw(capture_bbox, capture_region)
-                frames += 1
-            except Exception as e:
-                debug_print(f"⚠️ Ошибка при калибровке FPS: {e}")
-                break
+        left, top, right, bottom = capture_bbox
+        monitor = {
+            "left": left,
+            "top": top,
+            "width": right - left,
+            "height": bottom - top,
+        }
+        screenshot = capture_session.grab(monitor)
+        return cv2.cvtColor(np.asarray(screenshot), cv2.COLOR_BGRA2BGR)
 
-        elapsed = time.time() - start
-        if frames > 0 and elapsed > 0:
-            capture_fps = frames / elapsed
-            debug_print(f"   Кадров за калибровку: {frames}, время: {elapsed:.2f}с")
-            debug_print(f"   Оценка FPS захвата: {capture_fps:.1f}")
-            return capture_fps
+    def _draw_cursor_and_clicks(self, frame, x, y, w, h):
+        mouse_x, mouse_y = pyautogui.position()
+        rel_x = mouse_x - x
+        rel_y = mouse_y - y
+        if not (0 <= rel_x < w and 0 <= rel_y < h):
+            return
 
-        debug_print("⚠️ Не удалось померить FPS, используем заданный FPS")
-        return float(self.fps)
+        user32 = ctypes.windll.user32
+        left_down = bool(user32.GetAsyncKeyState(0x01) & 0x8000)
+        right_down = bool(user32.GetAsyncKeyState(0x02) & 0x8000)
+        if left_down and not self.prev_left_down:
+            self.click_anim_left = 10
+        if right_down and not self.prev_right_down:
+            self.click_anim_right = 10
+        self.prev_left_down = left_down
+        self.prev_right_down = right_down
+
+        cx, cy = int(rel_x), int(rel_y)
+        pts = np.array([
+            [cx, cy],
+            [cx + 10, cy + 25],
+            [cx + 4, cy + 18],
+            [cx - 6, cy + 22],
+        ], np.int32)
+        cv2.fillConvexPoly(frame, pts, (255, 255, 255))
+        cv2.polylines(frame, [pts], True, (0, 0, 0), 1)
+
+        if self.click_anim_left > 0:
+            radius = 20 + (10 - self.click_anim_left) * 2
+            cv2.circle(frame, (cx, cy), radius, (0, 0, 255), 2)
+            self.click_anim_left -= 1
+        if self.click_anim_right > 0:
+            radius = 20 + (10 - self.click_anim_right) * 2
+            cv2.circle(frame, (cx, cy), radius, (255, 0, 0), 2)
+            self.click_anim_right -= 1
+
+    @staticmethod
+    def _timing_summary(values):
+        if not values:
+            return "avg=0.00ms min=0.00ms p95=0.00ms"
+        ordered = sorted(values)
+        p95_index = min(len(ordered) - 1, int(len(ordered) * 0.95))
+        return (
+            f"avg={sum(values) / len(values) * 1000.0:.2f}ms "
+            f"min={ordered[0] * 1000.0:.2f}ms "
+            f"p95={ordered[p95_index] * 1000.0:.2f}ms"
+        )
 
     def run(self):
-        """
-        Захватывает область экрана и пишет кадры в VideoWriter.
-        Перед началом записи калибруем реальный FPS захвата и
-        используем min(реальный_fps, выбранный_fps), чтобы избежать
-        ускорения/замедления при воспроизведении.
-        """
         writer = None
+        frame_writer = None
+        capture_session = None
+        scheduler = None
+        last_frame = None
+        timings = {
+            "capture": [],
+            "cursor_and_clicks": [],
+            "write": [],
+            "wait": [],
+            "frame": [],
+        }
         try:
-            debug_print(f"Начало записи в {self.output_path}")
-            debug_print(f"Область: {self.bbox}")
+            debug_print(f"Recording started: {self.output_path}")
+            debug_print(f"Capture rectangle: {self.bbox}")
 
             x, y, w, h = self.bbox
             capture_bbox = rect_to_capture_bbox(self.bbox)
             capture_region = rect_to_capture_region(self.bbox)
+            if not self.use_pyautogui_capture:
+                capture_session = mss.mss()
 
-            # --- КАЛИБРОВКА FPS ---
-            capture_fps = self._measure_capture_fps(capture_bbox, capture_region, duration=1.0)
-            # Фактический FPS: не выше желаемого и не ниже 5, чтобы плееры не сходили с ума
-            self.effective_fps = max(5.0, min(capture_fps, float(self.fps)))
-            frame_period = 1.0 / self.effective_fps
-
-            debug_print(f"🎯 Желаемый FPS: {self.fps}")
-            debug_print(f"🎯 Реальный FPS захвата: {capture_fps:.1f}")
-            debug_print(f"🎯 Итоговый FPS записи: {self.effective_fps:.1f}")
-
-            start_time = time.time()
+            self.effective_fps = float(self.fps)
+            started_at = time.perf_counter()
+            scheduler = FrameScheduler(self.effective_fps, started_at)
+            debug_print(f"Target FPS: {self.effective_fps:.1f}")
 
             while self.is_recording:
-                if not self.is_paused:
-                    frame_start_time = time.time()
-                    try:
-                        # Захват скриншота
-                        if self.use_pyautogui_capture:
-                            screenshot = pyautogui.screenshot(region=capture_region)
-                            frame = cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2BGR)
+                now = time.perf_counter()
+                if self.is_paused:
+                    scheduler.pause(now)
+                    time.sleep(0.01)
+                    continue
+                if scheduler.is_paused:
+                    scheduler.resume(now)
+
+                wait_time = scheduler.wait_seconds(now)
+                if wait_time > 0:
+                    wait_started = time.perf_counter()
+                    time.sleep(wait_time)
+                    timings["wait"].append(time.perf_counter() - wait_started)
+                    continue
+
+                frame_started = time.perf_counter()
+                try:
+                    capture_started = time.perf_counter()
+                    frame = self._capture_frame(
+                        capture_bbox, capture_region, capture_session
+                    )
+                    timings["capture"].append(time.perf_counter() - capture_started)
+                    self.captured_frame_count += 1
+                    scheduler.mark_captured()
+
+                    overlay_started = time.perf_counter()
+                    self._draw_cursor_and_clicks(frame, x, y, w, h)
+                    timings["cursor_and_clicks"].append(
+                        time.perf_counter() - overlay_started
+                    )
+
+                    if writer is None:
+                        output_path_str = str(self.output_path)
+                        if output_path_str.lower().endswith(".avi"):
+                            fourcc = cv2.VideoWriter_fourcc(*"XVID")
                         else:
-                            screenshot = self._grab_pil_frame(capture_bbox)
-                            frame = cv2.cvtColor(np.array(screenshot), cv2.COLOR_BGR2RGB)
-                            # NOTE: предыдущая строка была RGB2BGR, оставь как было, если цвета уйдут.
-                            # Я просто показываю место, где можно поправить, если нужно.
-
-                        # ===== Рисуем курсор и клики =====
-                        mouse_x, mouse_y = pyautogui.position()
-                        rel_x = mouse_x - x
-                        rel_y = mouse_y - y
-                        if 0 <= rel_x < w and 0 <= rel_y < h:
-                            user32 = ctypes.windll.user32
-                            left_down = bool(user32.GetAsyncKeyState(0x01) & 0x8000)
-                            right_down = bool(user32.GetAsyncKeyState(0x02) & 0x8000)
-                            if left_down and not self.prev_left_down:
-                                self.click_anim_left = 10
-                            if right_down and not self.prev_right_down:
-                                self.click_anim_right = 10
-                            self.prev_left_down = left_down
-                            self.prev_right_down = right_down
-
-                            cx, cy = int(rel_x), int(rel_y)
-                            pts = np.array([
-                                [cx, cy],
-                                [cx + 10, cy + 25],
-                                [cx + 4, cy + 18],
-                                [cx - 6, cy + 22],
-                            ], np.int32)
-                            cv2.fillConvexPoly(frame, pts, (255, 255, 255))
-                            cv2.polylines(frame, [pts], True, (0, 0, 0), 1)
-
-                            if self.click_anim_left > 0:
-                                radius = 20 + (10 - self.click_anim_left) * 2
-                                cv2.circle(frame, (cx, cy), radius, (0, 0, 255), 2)
-                                self.click_anim_left -= 1
-                            if self.click_anim_right > 0:
-                                radius = 20 + (10 - self.click_anim_right) * 2
-                                cv2.circle(frame, (cx, cy), radius, (255, 0, 0), 2)
-                                self.click_anim_right -= 1
-
-                        # Создаём VideoWriter на первом кадре с ИТОГОВЫМ FPS
-                        if writer is None:
-                            output_path_str = str(self.output_path)
-                            # Для AVI используем кодек XVID; для MP4 – mp4v.
-                            if output_path_str.lower().endswith('.avi'):
-                                fourcc = cv2.VideoWriter_fourcc(*'XVID')
-                            else:
-                                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                            h_frame, w_frame = frame.shape[:2]
-                            writer = cv2.VideoWriter(
-                                output_path_str,
-                                fourcc,
-                                self.effective_fps,
-                                (w_frame, h_frame)
+                            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                        h_frame, w_frame = frame.shape[:2]
+                        writer = cv2.VideoWriter(
+                            output_path_str,
+                            fourcc,
+                            self.effective_fps,
+                            (w_frame, h_frame),
+                        )
+                        if not writer.isOpened():
+                            raise Exception(
+                                "Failed to open VideoWriter; check installed codecs"
                             )
-                            if not writer.isOpened():
-                                raise Exception("Не удалось открыть VideoWriter - проверьте кодеки")
+                        frame_writer = AsyncFrameWriter(writer)
+                        self.video_writer = frame_writer
 
-                        # Пишем кадр
-                        writer.write(frame)
-                        self.frame_count += 1
-                        if self.frame_count % 30 == 0:
-                            debug_print(f"✓ Захвачено кадров: {self.frame_count}")
-
-                        # Держим реальное время в такт FPS
-                        elapsed = time.time() - frame_start_time
-                        sleep_time = frame_period - elapsed
-                        if sleep_time > 0:
-                            time.sleep(sleep_time)
-
-                    except Exception as e:
-                        debug_print(f"⚠️ Ошибка захвата: {e}")
-                        time.sleep(0.05)
-                        continue
-                else:
+                    due_frames = scheduler.claim_due_frames(time.perf_counter())
+                    if due_frames == 0:
+                        output_wait = scheduler.output_wait_seconds(
+                            time.perf_counter()
+                        )
+                        if output_wait:
+                            time.sleep(output_wait)
+                        due_frames = scheduler.claim_due_frames(
+                            time.perf_counter()
+                        )
+                    write_started = time.perf_counter()
+                    if due_frames:
+                        frame_writer.submit(frame, due_frames)
+                    timings["write"].append(time.perf_counter() - write_started)
+                    self.frame_count += due_frames
+                    self.missed_frame_count += max(0, due_frames - 1)
+                    last_frame = frame
+                    timings["frame"].append(time.perf_counter() - frame_started)
+                except Exception as exc:
+                    debug_print(f"Capture error: {exc}")
                     time.sleep(0.01)
 
-            # --- Завершение ---
-            total_elapsed = time.time() - start_time
-            debug_print(f"\n📊 Захват завершен:")
-            debug_print(f"   Кадров: {self.frame_count}")
-            debug_print(f"   Время: {total_elapsed:.1f}с")
-            actual_fps = self.frame_count / total_elapsed if total_elapsed > 0 else self.effective_fps
-            debug_print(f"   Фактический FPS по счёту: {actual_fps:.1f}\n")
+            stopped_at = time.perf_counter()
+            self.active_recording_seconds = scheduler.active_elapsed(stopped_at)
+            target_frames = scheduler.final_frame_count(stopped_at)
+            if writer is not None and last_frame is not None:
+                write_started = time.perf_counter()
+                missing_frames = max(0, target_frames - self.frame_count)
+                if missing_frames:
+                    frame_writer.submit(last_frame, missing_frames)
+                    self.frame_count += missing_frames
+                    self.missed_frame_count += missing_frames
+                timings["write"].append(time.perf_counter() - write_started)
 
-            if writer is not None:
-                writer.release()
+            debug_print("Capture finished")
+            debug_print(f"Captured frames: {self.captured_frame_count}")
+            debug_print(f"Output frames: {self.frame_count}")
+            debug_print(f"Missed deadlines: {self.missed_frame_count}")
+            debug_print(
+                f"Active wall time: {self.active_recording_seconds:.3f}s"
+            )
+            actual_fps = (
+                self.captured_frame_count / self.active_recording_seconds
+                if self.active_recording_seconds > 0
+                else 0.0
+            )
+            debug_print(f"Actual capture FPS: {actual_fps:.2f}")
+            for stage, values in timings.items():
+                debug_print(f"Timing {stage}: {self._timing_summary(values)}")
+
+            if frame_writer is not None:
+                frame_writer.close()
+                frame_writer = None
+                writer = None
+                self.video_writer = None
 
             if self.frame_count == 0:
                 raise Exception("Не было захвачено ни одного кадра")
@@ -324,17 +383,27 @@ class RecorderThread(QThread):
             if Path(output_path_str).exists():
                 file_size = Path(output_path_str).stat().st_size / (1024 * 1024)
                 debug_print(
-                    f"\n✅ Видео успешно сохранено! Размер: {file_size:.1f} MB; кадры: {self.frame_count}; "
-                    f"FPS записи: {self.effective_fps:.1f}\n"
+                    f"Video saved: size={file_size:.1f} MB; "
+                    f"frames={self.frame_count}; FPS={self.effective_fps:.1f}"
                 )
             else:
-                debug_print("\n⚠️ Видео файл не найден после завершения записи!\n")
+                debug_print("Video file was not found after recording")
 
         except Exception as e:
             error_msg = f"Ошибка при записи видео: {str(e)}"
-            debug_print(f"❌ {error_msg}\n")
+            debug_print(error_msg)
             self.error.emit(error_msg)
         finally:
+            if frame_writer is not None:
+                try:
+                    frame_writer.close()
+                except Exception as exc:
+                    debug_print(f"Frame writer close error: {exc}")
+            elif writer is not None:
+                writer.release()
+            self.video_writer = None
+            if capture_session is not None:
+                capture_session.close()
             self.frames = []
             self.is_recording = False
             self.finished.emit()
@@ -1036,6 +1105,7 @@ class ScreenRecorder(QMainWindow):
                                 '-i', str(raw_path),
                                 '-c:v', 'libx264',
                                 '-pix_fmt', 'yuv420p',
+                                '-movflags', '+faststart',
                                 str(final_path)
                             ]
                             debug_print(f"Запуск ffmpeg: {' '.join(cmd)}")
