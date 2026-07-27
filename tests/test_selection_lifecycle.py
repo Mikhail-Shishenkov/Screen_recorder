@@ -7,6 +7,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PyQt5.QtCore import QCoreApplication, QEvent
 from PyQt5.QtWidgets import QApplication
 
+from audio_capture import AudioCaptureError
 from screen_recorder import ScreenRecorder
 
 
@@ -43,6 +44,31 @@ class FakeRecorderThread:
         self.is_recording = False
         self._running = False
         self.finished.emit()
+
+
+class FakeAudioSession:
+    def __init__(self, fail=False):
+        self.fail = fail
+        self.started = False
+        self.stopped = False
+
+    def start(self):
+        if self.fail:
+            raise AudioCaptureError("second source failed")
+        self.started = True
+
+    def set_paused(self, paused):
+        pass
+
+    def request_stop(self):
+        pass
+
+    def stop(self):
+        self.stopped = True
+        return []
+
+    def cleanup(self):
+        pass
 
 
 class SelectionLifecycleTests(unittest.TestCase):
@@ -156,6 +182,31 @@ class SelectionLifecycleTests(unittest.TestCase):
         self.assertTrue(self.recorder.isVisible())
         self.assertFalse(self.recorder.isMinimized())
         self.assertTrue(self.recorder.select_btn.isEnabled())
+
+    def test_audio_start_error_keeps_app_open_and_allows_retry(self):
+        self.recorder.recording_rect = (10, 20, 100, 100)
+        self.recorder.record_btn.setEnabled(True)
+        failed_session = FakeAudioSession(fail=True)
+
+        with patch("screen_recorder.AudioSession", return_value=failed_session):
+            self.recorder.record_btn.click()
+
+        self.assertTrue(self.recorder.isVisible())
+        self.assertFalse(self.recorder.recording)
+        self.assertTrue(self.recorder.record_btn.isEnabled())
+        self.assertTrue(self.recorder.audio_combo.isEnabled())
+
+        working_session = FakeAudioSession()
+        with patch("screen_recorder.AudioSession", return_value=working_session):
+            self.recorder.record_btn.click()
+
+        self.assertTrue(working_session.started)
+        self.assertTrue(self.recorder.recording)
+        worker = self.recorder.recorder_thread
+        self.recorder.stop_btn.click()
+        worker.complete()
+        self.app.processEvents()
+        self.assertFalse(self.recorder.recording)
 
 
 if __name__ == "__main__":

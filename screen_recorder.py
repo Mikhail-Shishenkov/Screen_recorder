@@ -5,8 +5,6 @@ import sys
 import os
 import pyautogui
 import ctypes
-import shutil
-import subprocess
 import traceback
 
 
@@ -23,6 +21,8 @@ from region_geometry import (
 )
 from frame_scheduler import FrameScheduler
 from async_frame_writer import AsyncFrameWriter
+from audio_capture import AUDIO_MODE_LABELS, AudioCaptureError, AudioSession
+from media_mux import MediaMuxError, mux_recording
 
 
 from PyQt5.QtWidgets import (
@@ -663,8 +663,7 @@ class ScreenRecorder(QMainWindow):
         self.border_window = None
         self.selector_overlay = None
         self.keyboard = None  # модуль для глобальных хоткеев
-        # Previously, an audio_thread attribute was used to record audio.  Since
-        # audio recording has been removed, we no longer initialize it.
+        self.audio_session = None
 
         # UI
         central = QWidget()
@@ -743,8 +742,18 @@ class ScreenRecorder(QMainWindow):
         )
         params_layout.addWidget(self.quality_combo)
 
-        # Note: audio recording support has been removed.  If needed, use a
-        # separate tool to capture system audio.
+        audio_label = QLabel("Звук:")
+        audio_label.setStyleSheet("font-family: 'Palatino Linotype', serif; color: #4a5f8f;")
+        params_layout.addWidget(audio_label)
+
+        self.audio_combo = QComboBox()
+        for label, mode in AUDIO_MODE_LABELS:
+            self.audio_combo.addItem(label, mode)
+        self.audio_combo.setStyleSheet(self.quality_combo.styleSheet())
+        self.audio_combo.setToolTip(
+            "Выключен / Системный звук / Микрофон / Система + микрофон"
+        )
+        params_layout.addWidget(self.audio_combo)
 
         params_layout.addStretch()
         layout.addLayout(params_layout)
@@ -986,6 +995,7 @@ class ScreenRecorder(QMainWindow):
         self.pause_btn.setEnabled(True)
         self.stop_btn.setEnabled(True)
         self.select_btn.setEnabled(False)
+        self.audio_combo.setEnabled(False)
 
         # Создать папку для сохранения.  Новое название папки — 'Мои записи'
         recordings_dir = Path("Мои записи")
@@ -1011,6 +1021,28 @@ class ScreenRecorder(QMainWindow):
         debug_print("НАЧАЛО НОВОЙ ЗАПИСИ")
         debug_print("=" * 60)
 
+        audio_mode = self.audio_combo.currentData()
+        audio_prefix = recordings_dir / f"recording_{timestamp}_audio"
+        self.audio_session = AudioSession(
+            audio_mode,
+            audio_prefix,
+            logger=debug_print,
+            diagnostics=DEBUG,
+        )
+        try:
+            self.audio_session.start()
+        except AudioCaptureError as exc:
+            debug_print(f"Audio start failed: {exc}")
+            self.audio_session = None
+            self.recording = False
+            self.record_btn.setEnabled(True)
+            self.pause_btn.setEnabled(False)
+            self.stop_btn.setEnabled(False)
+            self.select_btn.setEnabled(True)
+            self.audio_combo.setEnabled(True)
+            self.status_label.setText(f"❌ Ошибка звука: {exc}")
+            return
+
         self.recorder_thread = RecorderThread(
             self.recording_rect,
             str(output_file),
@@ -1019,10 +1051,6 @@ class ScreenRecorder(QMainWindow):
         self.recorder_thread.finished.connect(self.on_recording_finished)
         self.recorder_thread.error.connect(self.on_recording_error)
         self.recorder_thread.start()
-
-        # Audio recording support has been removed, so we no longer start
-        # a separate audio thread.  If you need to record sound, please use
-        # an external tool in parallel with this screen recorder.
 
         # Показать рамку вокруг области записи
         if self.border_window:
@@ -1044,6 +1072,8 @@ class ScreenRecorder(QMainWindow):
 
         self.paused = not self.paused
         self.recorder_thread.is_paused = self.paused
+        if self.audio_session is not None:
+            self.audio_session.set_paused(self.paused)
         if self.paused:
             self.pause_btn.setText("⏯️ Продолжить")
             # Update status text with new hotkey (Ctrl+2) for resume
@@ -1061,7 +1091,8 @@ class ScreenRecorder(QMainWindow):
             self.stop_btn.setEnabled(False)
             debug_print("⏹️ Остановка записи...")
 
-        # Audio recording has been removed; no audio thread to stop
+        if self.audio_session is not None:
+            self.audio_session.request_stop()
 
         # Спрятать рамку сразу при остановке
         if self.border_window:
@@ -1078,107 +1109,100 @@ class ScreenRecorder(QMainWindow):
         self.pause_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.select_btn.setEnabled(True)
+        self.audio_combo.setEnabled(True)
         self.pause_btn.setText("⏸️ Пауза")
         self._debug_selection_state("recording finished")
 
-        # Убедимся, что рамка закрыта
         if self.border_window:
             self.border_window.close()
             self.border_window = None
 
-        # No audio thread to wait for; audio recording has been removed
+        audio_tracks = []
+        audio_error = None
+        if self.audio_session is not None:
+            try:
+                audio_tracks = self.audio_session.stop()
+            except AudioCaptureError as exc:
+                audio_error = exc
+                debug_print(f"Audio stop failed: {exc}")
 
-        if self.recorder_thread and self.recorder_thread.output_path:
-            raw_path = Path(self.recorder_thread.output_path)
-            if raw_path.exists():
-                # Попробуем перекодировать файл в H.264, если установлен ffmpeg
-                final_msg = ""
-                if hasattr(self, 'final_output_path') and hasattr(self, 'temp_output_path'):
-                    try:
-                        # Проверяем наличие ffmpeg
-                        ffmpeg_path = shutil.which('ffmpeg')
-                        if ffmpeg_path:
-                            # Выполняем конвертацию: mp4v -> h264
-                            final_path = Path(self.final_output_path)
-                            cmd = [
-                                ffmpeg_path, '-y',
-                                '-i', str(raw_path),
-                                '-c:v', 'libx264',
-                                '-pix_fmt', 'yuv420p',
-                                '-movflags', '+faststart',
-                                str(final_path)
-                            ]
-                            debug_print(f"Запуск ffmpeg: {' '.join(cmd)}")
-                            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                            if result.returncode == 0 and final_path.exists():
-                                # Удаляем исходный временный файл
-                                try:
-                                    raw_path.unlink()
-                                except Exception:
-                                    pass
-                                size_mb = final_path.stat().st_size / (1024 * 1024)
-                                final_msg = (
-                                    f"✅ ГОТОВО! Видео сохранено ({size_mb:.1f} MB) в формате H.264."
-                                )
-                                self.status_label.setText(final_msg)
-                                debug_print(f"✅ Файл успешно перекодирован в H.264: {final_path}\n")
-                            else:
-                                # ffmpeg нашелся, но конвертация не удалась
-                                final_msg = ("⚠️ ffmpeg не смог конвертировать видео. "
-                                             "Будет использован исходный файл.")
-                                self.status_label.setText(final_msg)
-                                size_mb = raw_path.stat().st_size / (1024 * 1024)
-                                debug_print(f"⚠️ ffmpeg завершился с кодом {result.returncode}. "
-                                            f"Исходный файл {raw_path} ({size_mb:.1f} MB) будет оставлен.\n")
-                        else:
-                            # ffmpeg не найден – просто переименуем файл
-                            if hasattr(self, 'final_output_path'):
-                                try:
-                                    raw_path.rename(self.final_output_path)
-                                    final_path = Path(self.final_output_path)
-                                    size_mb = final_path.stat().st_size / (1024 * 1024)
-                                    final_msg = (
-                                        f"⚠️ ffmpeg не найден, поэтому видео сохранено как RAW MP4 ({size_mb:.1f} MB)."
-                                    )
-                                    self.status_label.setText(final_msg)
-                                    debug_print(f"⚠️ ffmpeg не найден. Видео сохранено без перекодирования: {final_path}\n")
-                                except Exception:
-                                    size_mb = raw_path.stat().st_size / (1024 * 1024)
-                                    self.status_label.setText(
-                                        f"❌ Ошибка переименования. Видео сохранено как RAW MP4 ({size_mb:.1f} MB)."
-                                    )
-                                    debug_print(
-                                        f"❌ Ошибка переименования файла {raw_path}. Видео сохранено без изменения.\n"
-                                    )
-                    except Exception as e:
-                        # Любая ошибка при конвертации
-                        size_mb = raw_path.stat().st_size / (1024 * 1024)
-                        self.status_label.setText(
-                            f"⚠️ Ошибка конвертации: {str(e)}. Видео сохранено как RAW MP4 ({size_mb:.1f} MB)."
-                        )
-                        debug_print(f"⚠️ Ошибка при вызове ffmpeg: {e}\n")
-                else:
-                    # Нет информации о файлах — просто показываем, что файл сохранен
-                    size_mb = raw_path.stat().st_size / (1024 * 1024)
-                    self.status_label.setText(
-                        f"✅ ГОТОВО! Видео сохранено ({size_mb:.1f} MB)"
-                    )
-                    debug_print(f"✅ Файл успешно сохранен: {raw_path}\n")
-            else:
-                self.status_label.setText("❌ Файл не найден!")
-                debug_print(f"❌ Ошибка: файл не найден {raw_path}\n")
-        else:
+        if not self.recorder_thread or not self.recorder_thread.output_path:
             self.status_label.setText("❌ Ошибка при сохранении!")
-            debug_print("❌ Ошибка: не удалось сохранить видео\n")
+            self.audio_session = None
+            return
+
+        raw_path = Path(self.recorder_thread.output_path)
+        final_path = Path(self.final_output_path)
+        if not raw_path.exists():
+            self.status_label.setText("❌ Файл не найден!")
+            debug_print(f"Raw video file not found: {raw_path}")
+            self.audio_session = None
+            return
+
+        try:
+            output_duration = (
+                self.recorder_thread.frame_count
+                / self.recorder_thread.effective_fps
+            )
+            mux_recording(
+                raw_path,
+                final_path,
+                audio_tracks if audio_error is None else [],
+                output_duration=output_duration,
+                logger=debug_print,
+                diagnostics=DEBUG,
+            )
+            raw_path.unlink()
+            if self.audio_session is not None:
+                self.audio_session.cleanup()
+
+            video_duration = self.recorder_thread.active_recording_seconds
+            audio_duration = max(
+                (track.duration for track in audio_tracks),
+                default=0.0,
+            )
+            if audio_tracks:
+                debug_print(
+                    f"Audio/video duration: audio={audio_duration:.3f}s "
+                    f"video={video_duration:.3f}s "
+                    f"delta={abs(audio_duration - video_duration):.3f}s"
+                )
+
+            size_mb = final_path.stat().st_size / (1024 * 1024)
+            if audio_error is not None:
+                self.status_label.setText(
+                    f"⚠️ Видео сохранено без звука ({size_mb:.1f} MB): {audio_error}"
+                )
+            else:
+                self.status_label.setText(
+                    f"✅ ГОТОВО! Видео сохранено ({size_mb:.1f} MB) в формате H.264."
+                )
+        except (MediaMuxError, OSError) as exc:
+            debug_print(f"Recording mux failed: {exc}")
+            self.status_label.setText(
+                f"❌ Ошибка сохранения: {exc}. Временные файлы сохранены."
+            )
+        finally:
+            self.audio_session = None
 
     def on_recording_error(self, error_msg):
         debug_print(f"❌ {error_msg}\n")
         self.status_label.setText(f"❌ {error_msg}")
+        self.recording = False
         self.record_btn.setEnabled(True)
         self.pause_btn.setEnabled(False)
         self.stop_btn.setEnabled(False)
         self.select_btn.setEnabled(True)
+        self.audio_combo.setEnabled(True)
         self.recorder_thread = None
+
+        if self.audio_session is not None:
+            try:
+                self.audio_session.stop()
+            except AudioCaptureError as exc:
+                debug_print(f"Audio cleanup after video error failed: {exc}")
+            self.audio_session.cleanup()
+            self.audio_session = None
 
         if self.border_window:
             self.border_window.close()

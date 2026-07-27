@@ -1,12 +1,22 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import shutil
+
+
+ffmpeg_path = shutil.which('ffmpeg')
+if not ffmpeg_path:
+    raise RuntimeError('ffmpeg.exe is required to build the portable recorder')
 
 a = Analysis(
     ['screen_recorder.py'],
     pathex=[],
-    binaries=[],
+    binaries=[(ffmpeg_path, '.')],
     datas=[('spider-man-dance.gif', '.')],
-    hiddenimports=[],
+    hiddenimports=[
+        'pyaudiowpatch',
+        '_portaudiowpatch',
+        'soundcard',
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

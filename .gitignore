@@ -25,3 +25,12 @@ Thumbs.db
 
 # Secrets
 .env
+/rollback_before_interface_dpi_reset.patch
+/Мои записи/recording_20260727_185256.mp4
+/Мои записи/recording_20260727_185259.mp4
+/Мои записи/recording_20260727_185301.mp4
+/benchmark_output/after/results.json
+/benchmark_output/before/results.json
+/benchmark_output/async_candidate/results.json
+/benchmark_output/production_smoke_4/results.json
+/benchmark_output/production_smoke_4/smoke_1920x1080_30fps.mp4
