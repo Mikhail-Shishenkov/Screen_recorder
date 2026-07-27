@@ -14,13 +14,18 @@ import cv2
 import numpy as np
 from PyQt5.QtGui import QMovie
 from PyQt5.QtWidgets import QDialog
+from region_geometry import (
+    normalize_selection_rect,
+    rect_to_capture_bbox,
+    rect_to_capture_region,
+)
 
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout,
     QHBoxLayout, QPushButton, QLabel, QComboBox, QSpinBox
 )
-from PyQt5.QtCore import pyqtSignal, QThread, Qt, QTimer
+from PyQt5.QtCore import pyqtSignal, QThread, Qt, QTimer, QRect
 
 import platform
 from PyQt5.QtGui import QPainter, QPen, QColor
@@ -32,6 +37,57 @@ DEBUG = False
 def debug_print(*args, **kwargs):
     if DEBUG:
         print(*args, **kwargs)
+
+
+def enable_dpi_awareness():
+    """Make the process per-monitor DPI aware before QApplication exists."""
+    if not sys.platform.startswith("win"):
+        return
+
+    try:
+        if ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
+            return
+    except Exception:
+        pass
+
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        return
+    except Exception:
+        pass
+
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
+def get_virtual_screen_geometry():
+    """Return the virtual desktop bounds in physical screen coordinates."""
+    if sys.platform.startswith("win"):
+        try:
+            user32 = ctypes.windll.user32
+            return QRect(
+                user32.GetSystemMetrics(76),
+                user32.GetSystemMetrics(77),
+                user32.GetSystemMetrics(78),
+                user32.GetSystemMetrics(79),
+            )
+        except Exception:
+            pass
+
+    app = QApplication.instance()
+    if app:
+        geometry = QRect()
+        for screen in app.screens():
+            geometry = geometry.united(screen.geometry())
+        if not geometry.isNull():
+            return geometry
+
+    primary_screen = QApplication.primaryScreen()
+    if primary_screen:
+        return primary_screen.geometry()
+    return QRect(0, 0, 0, 0)
 
 
 # ===== RAMKA ZAPISI (PyQt-окошко поверх всего) =====
@@ -93,17 +149,23 @@ class RecorderThread(QThread):
         self.video_writer = None
 
     # -------- ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ ЗАХВАТА --------
-    def _capture_frame_raw(self, capture_box):
+    def _grab_pil_frame(self, capture_bbox):
+        grab_kwargs = {"bbox": capture_bbox}
+        if sys.platform.startswith("win"):
+            grab_kwargs["all_screens"] = True
+        return ImageGrab.grab(**grab_kwargs)
+
+    def _capture_frame_raw(self, capture_bbox, capture_region):
         """Захват одного кадра без курсора и анимаций."""
         if self.use_pyautogui_capture:
-            screenshot = pyautogui.screenshot(region=capture_box)
+            screenshot = pyautogui.screenshot(region=capture_region)
             frame = cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2BGR)
         else:
-            screenshot = ImageGrab.grab(bbox=capture_box)
+            screenshot = self._grab_pil_frame(capture_bbox)
             frame = cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2BGR)
         return frame
 
-    def _measure_capture_fps(self, capture_box, duration=1.0):
+    def _measure_capture_fps(self, capture_bbox, capture_region, duration=1.0):
         """
         Быстренько меряем реальный FPS захвата экрана,
         чтобы не ускорять/замедлять итоговое видео.
@@ -114,7 +176,7 @@ class RecorderThread(QThread):
 
         while time.time() - start < duration and self.is_recording:
             try:
-                self._capture_frame_raw(capture_box)
+                self._capture_frame_raw(capture_bbox, capture_region)
                 frames += 1
             except Exception as e:
                 debug_print(f"⚠️ Ошибка при калибровке FPS: {e}")
@@ -143,10 +205,11 @@ class RecorderThread(QThread):
             debug_print(f"Область: {self.bbox}")
 
             x, y, w, h = self.bbox
-            capture_box = (x, y, x + w, y + h)
+            capture_bbox = rect_to_capture_bbox(self.bbox)
+            capture_region = rect_to_capture_region(self.bbox)
 
             # --- КАЛИБРОВКА FPS ---
-            capture_fps = self._measure_capture_fps(capture_box, duration=1.0)
+            capture_fps = self._measure_capture_fps(capture_bbox, capture_region, duration=1.0)
             # Фактический FPS: не выше желаемого и не ниже 5, чтобы плееры не сходили с ума
             self.effective_fps = max(5.0, min(capture_fps, float(self.fps)))
             frame_period = 1.0 / self.effective_fps
@@ -163,10 +226,10 @@ class RecorderThread(QThread):
                     try:
                         # Захват скриншота
                         if self.use_pyautogui_capture:
-                            screenshot = pyautogui.screenshot(region=capture_box)
+                            screenshot = pyautogui.screenshot(region=capture_region)
                             frame = cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2BGR)
                         else:
-                            screenshot = ImageGrab.grab(bbox=capture_box)
+                            screenshot = self._grab_pil_frame(capture_bbox)
                             frame = cv2.cvtColor(np.array(screenshot), cv2.COLOR_BGR2RGB)
                             # NOTE: предыдущая строка была RGB2BGR, оставь как было, если цвета уйдут.
                             # Я просто показываю место, где можно поправить, если нужно.
@@ -343,6 +406,146 @@ class RegionSelectorTkinter:
     def show(self):
         self.root.mainloop()
 
+class RegionSelectorOverlay(QWidget):
+    selection_made = pyqtSignal(int, int, int, int)
+    selection_canceled = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.virtual_geometry = get_virtual_screen_geometry()
+        self.start_point = None
+        self.current_point = None
+        self.message = "Drag to select an area. Esc cancels."
+
+        self.setWindowFlags(
+            Qt.FramelessWindowHint |
+            Qt.WindowStaysOnTopHint |
+            Qt.Tool
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setMouseTracking(True)
+        self.setCursor(Qt.CrossCursor)
+        self.setGeometry(self.virtual_geometry)
+
+    def show_overlay(self):
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self.grabKeyboard()
+
+    def closeEvent(self, event):
+        if self.keyboardGrabber() is self:
+            self.releaseKeyboard()
+        super().closeEvent(event)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.selection_canceled.emit()
+            self.close()
+            return
+        super().keyPressEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.LeftButton:
+            return
+        self.start_point = event.globalPos()
+        self.current_point = event.globalPos()
+        self.message = "Release to confirm. Esc cancels."
+        self.update()
+
+    def mouseMoveEvent(self, event):
+        if self.start_point is None:
+            return
+        self.current_point = event.globalPos()
+        self.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() != Qt.LeftButton or self.start_point is None:
+            return
+
+        self.current_point = event.globalPos()
+        rect = normalize_selection_rect(
+            self.start_point.x(),
+            self.start_point.y(),
+            self.current_point.x(),
+            self.current_point.y(),
+        )
+        if rect is None:
+            self.start_point = None
+            self.current_point = None
+            self.message = "Area must be at least 2x2 px after even rounding."
+            self.update()
+            return
+
+        self.selection_made.emit(*rect)
+        self.close()
+
+    def _raw_preview_rect(self):
+        if self.start_point is None or self.current_point is None:
+            return None
+        x1 = self.start_point.x()
+        y1 = self.start_point.y()
+        x2 = self.current_point.x()
+        y2 = self.current_point.y()
+        return min(x1, x2), min(y1, y2), abs(x2 - x1), abs(y2 - y1)
+
+    def _preview_rect(self):
+        if self.start_point is None or self.current_point is None:
+            return None
+        normalized = normalize_selection_rect(
+            self.start_point.x(),
+            self.start_point.y(),
+            self.current_point.x(),
+            self.current_point.y(),
+        )
+        return normalized or self._raw_preview_rect()
+
+    def _to_local_qrect(self, rect):
+        x, y, width, height = rect
+        return QRect(
+            x - self.virtual_geometry.x(),
+            y - self.virtual_geometry.y(),
+            width,
+            height,
+        )
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor(0, 0, 0, 96))
+
+        preview_rect = self._preview_rect()
+        if preview_rect:
+            local_rect = self._to_local_qrect(preview_rect)
+            painter.fillRect(local_rect, QColor(255, 255, 255, 24))
+            painter.setPen(QPen(QColor(0, 255, 0), 2))
+            painter.drawRect(local_rect.adjusted(0, 0, -1, -1))
+
+            label_width = max(140, local_rect.width())
+            label_rect = QRect(
+                local_rect.x(),
+                max(0, local_rect.y() - 28),
+                label_width,
+                24,
+            )
+            painter.fillRect(label_rect, QColor(0, 0, 0, 180))
+            painter.setPen(QColor(255, 255, 255))
+            painter.drawText(
+                label_rect.adjusted(8, 0, -8, 0),
+                Qt.AlignVCenter | Qt.AlignLeft,
+                f"{preview_rect[2]}x{preview_rect[3]}",
+            )
+
+        if self.message:
+            message_rect = QRect(20, 20, max(320, self.width() - 40), 24)
+            painter.fillRect(message_rect, QColor(0, 0, 0, 180))
+            painter.setPen(QColor(255, 255, 255))
+            painter.drawText(
+                message_rect.adjusted(8, 0, -8, 0),
+                Qt.AlignVCenter | Qt.AlignLeft,
+                self.message,
+            )
+
+
 class HelpWindow(QDialog):
     def __init__(self):
         super().__init__()
@@ -379,6 +582,7 @@ class ScreenRecorder(QMainWindow):
         self.recorder_thread = None
         self.recording_rect = None
         self.border_window = None
+        self.selector_overlay = None
         self.keyboard = None  # модуль для глобальных хоткеев
         # Previously, an audio_thread attribute was used to record audio.  Since
         # audio recording has been removed, we no longer initialize it.
@@ -562,13 +766,28 @@ class ScreenRecorder(QMainWindow):
 
     def select_region(self):
         self.status_label.setText("📌 Выбирайте область... (ESC для отмены)")
-        selector = RegionSelectorTkinter(self.on_region_selected)
-        selector.show()
+        if self.selector_overlay and self.selector_overlay.isVisible():
+            return
+
+        self.select_btn.setEnabled(False)
+        self.selector_overlay = RegionSelectorOverlay()
+        self.selector_overlay.selection_made.connect(self.on_region_selected)
+        self.selector_overlay.selection_canceled.connect(self.on_region_selection_canceled)
+        self.selector_overlay.destroyed.connect(self.on_region_selector_closed)
+        self.selector_overlay.show_overlay()
 
     def on_region_selected(self, x, y, w, h):
         self.recording_rect = (x, y, w, h)
         self.status_label.setText(f"✅ Выбрана область: {w}×{h} пикселей. Готово к записи.")
         self.record_btn.setEnabled(True)
+
+    def on_region_selection_canceled(self):
+        self.status_label.setText("Selection canceled.")
+        self.record_btn.setEnabled(self.recording_rect is not None)
+
+    def on_region_selector_closed(self, *args):
+        self.selector_overlay = None
+        self.select_btn.setEnabled(True)
 
     def start_recording(self):
         # Защита от повторного старта
@@ -786,6 +1005,7 @@ class ScreenRecorder(QMainWindow):
 
 
 if __name__ == "__main__":
+    enable_dpi_awareness()
     app = QApplication(sys.argv)
     window = ScreenRecorder()
     window.show()
