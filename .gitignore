@@ -15,17 +15,32 @@ env/
 build/
 dist/
 /release/
+*.toc
+*.pyz
+*.pkg
+warn-*.txt
+xref-*.html
 
 # Generated recordings and diagnostics
 /Мои записи/
 /benchmark_output/
 *.wav
 *.mp4
+*.avi
+*.mkv
+*.mov
 *.json
 
 # Temporary files
 *.log
 *.tmp
+*.bak
+*.part
+*.swp
+*.swo
+.pytest_cache/
+.coverage
+htmlcov/
 
 # OS
 Thumbs.db
