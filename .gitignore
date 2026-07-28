@@ -14,6 +14,14 @@ env/
 # PyInstaller
 build/
 dist/
+/release/
+
+# Generated recordings and diagnostics
+/Мои записи/
+/benchmark_output/
+*.wav
+*.mp4
+*.json
 
 # Temporary files
 *.log

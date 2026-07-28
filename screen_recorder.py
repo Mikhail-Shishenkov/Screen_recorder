@@ -12,7 +12,7 @@ from PIL import ImageGrab
 import cv2
 import mss
 import numpy as np
-from PyQt5.QtGui import QMovie
+from PyQt5.QtGui import QFont, QIcon, QMovie
 from PyQt5.QtWidgets import QDialog
 from region_geometry import (
     normalize_selection_rect,
@@ -27,7 +27,7 @@ from media_mux import MediaMuxError, mux_recording
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout,
-    QHBoxLayout, QPushButton, QLabel, QComboBox, QSpinBox
+    QHBoxLayout, QGridLayout, QPushButton, QLabel, QComboBox, QFrame, QSizePolicy
 )
 from PyQt5.QtCore import pyqtSignal, QThread, Qt, QTimer, QRect
 
@@ -36,6 +36,12 @@ from PyQt5.QtGui import QPainter, QPen, QColor
 
 # === ВКЛ/ВЫКЛ логов в терминал ===
 DEBUG = False
+
+RECORDING_MODES = (
+    ("Для отправки — рекомендуется", 30),
+    ("Максимальное качество", 24),
+    ("Компактный размер", 15),
+)
 
 
 def debug_print(*args, **kwargs):
@@ -48,6 +54,31 @@ def debug_print(*args, **kwargs):
         print(*safe_args, **kwargs)
 
 
+def application_directory():
+    """Return the directory containing the executable or source entrypoint."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def recordings_directory():
+    """Keep user recordings next to the portable application."""
+    return application_directory() / "Мои записи"
+
+
+def bundled_resource_path(filename):
+    """Resolve a resource in development and a PyInstaller onefile bundle."""
+    bundle_dir = getattr(sys, "_MEIPASS", None)
+    if bundle_dir:
+        return Path(bundle_dir) / filename
+
+    root = application_directory()
+    direct_path = root / filename
+    if direct_path.is_file():
+        return direct_path
+    return root / "assets" / filename
+
+
 def enable_dpi_awareness():
     """Make the process per-monitor DPI aware before QApplication exists."""
     if not sys.platform.startswith("win"):
@@ -56,6 +87,18 @@ def enable_dpi_awareness():
     try:
         if ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
             return
+    except Exception:
+        pass
+
+
+def set_windows_app_user_model_id():
+    """Associate the process with the packaged Screen Recorder identity on Windows."""
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "ScreenRecorderPro.Portable"
+        )
     except Exception:
         pass
 
@@ -637,8 +680,7 @@ class HelpWindow(QDialog):
         self.label.setAlignment(Qt.AlignCenter)
         layout.addWidget(self.label)
 
-        base_path = getattr(sys, "_MEIPASS", os.path.abspath("."))
-        gif_path = os.path.join(base_path, "spider-man-dance.gif")
+        gif_path = str(bundled_resource_path("spider-man-dance.gif"))
 
         self.movie = QMovie(gif_path)
         self.label.setMovie(self.movie)
@@ -647,14 +689,10 @@ class HelpWindow(QDialog):
 class ScreenRecorder(QMainWindow):
     def __init__(self):
         super().__init__()
-        # Set the application title and a fixed aspect ratio.  Baroque designs
-        # typically have generous proportions; the user requested a 4:3 ratio
-        # roughly 740×400.  We'll set this directly and disallow resizing to
-        # preserve the layout.
         self.setWindowTitle("Screen Recorder Pro")
-        # Increase the default window size so that longer instructional text fits
-        # comfortably.  This also makes the controls easier to read.
-        self.setFixedSize(800, 500)
+        app_font = QFont("Segoe UI")
+        app_font.setPointSizeF(10.5)
+        self.setFont(app_font)
 
         self.recording = False
         self.paused = False
@@ -665,165 +703,212 @@ class ScreenRecorder(QMainWindow):
         self.keyboard = None  # модуль для глобальных хоткеев
         self.audio_session = None
 
-        # UI
-        central = QWidget()
-        self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
-
-        self.status_label = QLabel("Нажмите 'Выбрать область' для начала")
-        # Apply baroque-inspired styling: soft colours, serif font and subtle backgrounds
-        self.status_label.setStyleSheet(
-            "font-size: 18px; font-family: 'Palatino Linotype', 'Georgia', serif; "
-            "color: #4a5f8f; padding: 10px; font-weight: bold;"
-        )
-        layout.addWidget(self.status_label)
-
-        # Кнопки
-        buttons_layout = QHBoxLayout()
-        self.select_btn = QPushButton("📐 Выбрать область")
-        self.select_btn.setMinimumHeight(40)
-        self.select_btn.clicked.connect(self.select_region)
-
-        self.record_btn = QPushButton("🔴 Записать")
-        self.record_btn.setMinimumHeight(40)
-        self.record_btn.clicked.connect(self.start_recording)
-        self.record_btn.setEnabled(False)
-
-        self.pause_btn = QPushButton("⏸️ Пауза")
-        self.pause_btn.setMinimumHeight(40)
-        self.pause_btn.clicked.connect(self.toggle_pause)
-        self.pause_btn.setEnabled(False)
-
-        self.stop_btn = QPushButton("⏹️ Стоп")
-        self.stop_btn.setMinimumHeight(40)
-        self.stop_btn.clicked.connect(self.stop_recording)
-        self.stop_btn.setEnabled(False)
-
-        self.help_btn = QPushButton("🕷️ Help")
-        self.help_btn.setMinimumHeight(40)
-        self.help_btn.clicked.connect(self.show_help)
-
-        buttons_layout.addWidget(self.select_btn)
-        buttons_layout.addWidget(self.record_btn)
-        buttons_layout.addWidget(self.pause_btn)
-        buttons_layout.addWidget(self.stop_btn)
-        buttons_layout.addWidget(self.help_btn)
-        layout.addLayout(buttons_layout)
-
-        # Параметры
-        params_layout = QHBoxLayout()
-        params_layout.setSpacing(20)
-
-        # FPS selector
-        fps_label = QLabel("FPS:")
-        fps_label.setStyleSheet("font-family: 'Palatino Linotype', serif; color: #4a5f8f;")
-        params_layout.addWidget(fps_label)
-
-        self.fps_spin = QSpinBox()
-        self.fps_spin.setValue(30)
-        self.fps_spin.setRange(10, 60)
-        self.fps_spin.setStyleSheet(
-            "background: #f2e8d8; border: 1px solid #4a5f8f; border-radius: 3px; padding: 2px; "
-            "font-family: 'Palatino Linotype', serif; color: #4a5f8f;"
-        )
-        params_layout.addWidget(self.fps_spin)
-
-        # Quality drop-down
-        quality_label = QLabel("Качество:")
-        quality_label.setStyleSheet("font-family: 'Palatino Linotype', serif; color: #4a5f8f;")
-        params_layout.addWidget(quality_label)
-
-        self.quality_combo = QComboBox()
-        self.quality_combo.addItems(["Высокое (30 FPS)", "Среднее (24 FPS)", "Экономно (15 FPS)"])
-        self.quality_combo.setStyleSheet(
-            "QComboBox { background: #f2e8d8; border: 1px solid #4a5f8f; "
-            "border-radius: 3px; padding: 2px; font-family: 'Palatino Linotype', serif; color: #4a5f8f; }"
-            "QComboBox::drop-down { border: 0px; }"
-        )
-        params_layout.addWidget(self.quality_combo)
-
-        audio_label = QLabel("Звук:")
-        audio_label.setStyleSheet("font-family: 'Palatino Linotype', serif; color: #4a5f8f;")
-        params_layout.addWidget(audio_label)
-
-        self.audio_combo = QComboBox()
-        for label, mode in AUDIO_MODE_LABELS:
-            self.audio_combo.addItem(label, mode)
-        self.audio_combo.setStyleSheet(self.quality_combo.styleSheet())
-        self.audio_combo.setToolTip(
-            "Выключен / Системный звук / Микрофон / Система + микрофон"
-        )
-        params_layout.addWidget(self.audio_combo)
-
-        params_layout.addStretch()
-        layout.addLayout(params_layout)
-
-        # Инструкция
-        info_text = (
-            "ℹ️ Инструкция:\n"
-            "1. Нажмите 'Выбрать область' и выделите прямоугольник мышью.\n"
-            "2. Нажмите 'Записать' для начала записи (окно будет свернуто).\n"
-            "3. Горячие клавиши (глобальные):\n"
-            "   • Ctrl+1 — старт записи\n"
-            "   • Ctrl+2 — пауза/продолжить\n"
-            "   • Ctrl+3 — стоп записи\n"
-            "4. Во время записи вокруг выбранной области будет красная рамка.\n"
-            "5. Видео сохраняется в папку 'Мои записи' в формате MP4.\n"
-            "   Для воспроизведения в браузере требуется наличие ffmpeg: если он\n"
-            "   установлен, файл будет автоматически перекодирован в MP4 (H.264).\n"
-            "   Без ffmpeg видео сохраняется в сыром формате mp4v, который может\n"
-            "   не воспроизводиться в браузерах. Установите ffmpeg для лучшей\n"
-            "   совместимости."
-        )
-        info = QLabel(info_text)
-        info.setWordWrap(True)
-        info.setStyleSheet(
-            "color: #5a6f8f; font-size: 14px; margin: 15px; padding: 12px; "
-            "background: #f2e8d8; border-radius: 5px; border-left: 4px solid #4a5f8f; "
-            "font-family: 'Palatino Linotype', serif;"
-        )
-        layout.addWidget(info)
-        layout.addStretch()
-
-        # Apply a global stylesheet for a baroque-inspired look.  Soft gradients,
-        # ornate colours and serif fonts evoke a classic feel.  Buttons
-        # highlight on hover and disabled states are dimmed gracefully.
-        self.setStyleSheet(
-            "QMainWindow {"
-            "    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,"
-            "        stop:0 #e8dcc8, stop:0.5 #f2e8d8, stop:1 #e8dcc8);"
-            "    font-family: 'Palatino Linotype', 'Book Antiqua', 'Georgia', serif;"
-            "    color: #4a5f8f;"
-            "    font-size: 16px;"
-            "}"
-            "QPushButton {"
-            "    background-color: #8b6f47;"
-            "    color: white;"
-            "    border: 1px solid #4a5f8f;"
-            "    border-radius: 4px;"
-            "    padding: 8px 16px;"
-            "    font-family: 'Palatino Linotype', serif;"
-            "    font-size: 16px;"
-            "    font-weight: bold;"
-            "}"
-            "QPushButton:hover {"
-            "    background-color: #a68a6a;"
-            "}"
-            "QPushButton:disabled {"
-            "    background-color: #d0c6b1;"
-            "    color: #9b8c76;"
-            "    border-color: #a69b87;"
-            "}"
-            "QLabel {"
-            "    font-family: 'Palatino Linotype', serif;"
-            "    font-size: 16px;"
-            "}"
-        )
-
-        # Пытаемся подключить глобальные горячие клавиши
+        self._build_approved_ui()
         self.init_hotkeys()
 
     # === ГОРЯЧИЕ КЛАВИШИ (глобальные через модуль keyboard) ===
+    def _build_approved_ui(self):
+        self.resize(840, 600)
+        self.setMinimumSize(760, 560)
+        self.setWindowIcon(QIcon(str(bundled_resource_path("screen-recorder-icon.ico"))))
+
+        central = QWidget()
+        central.setObjectName("appRoot")
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(30, 26, 30, 22)
+        layout.setSpacing(18)
+
+        header = QHBoxLayout()
+        heading = QVBoxLayout()
+        heading.setSpacing(4)
+        title = QLabel("Screen Recorder Pro")
+        title.setObjectName("appTitle")
+        title.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+        subtitle = QLabel("Запись выбранной области без лишних настроек")
+        subtitle.setObjectName("appSubtitle")
+        subtitle.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+        heading.addWidget(title)
+        heading.addWidget(subtitle)
+        header.addLayout(heading)
+        header.addStretch()
+        self.help_btn = QPushButton("?")
+        self.help_btn.setObjectName("helpButton")
+        self.help_btn.setToolTip("Справка и Spider-Man")
+        self.help_btn.clicked.connect(self.show_help)
+        header.addWidget(self.help_btn)
+        layout.addLayout(header)
+
+        self.status_card = QFrame()
+        self.status_card.setObjectName("statusCard")
+        self.status_card.setMinimumHeight(92)
+        status_layout = QHBoxLayout(self.status_card)
+        status_layout.setContentsMargins(18, 16, 18, 16)
+        status_layout.setSpacing(16)
+        self.status_icon = QLabel("1")
+        self.status_icon.setObjectName("statusIcon")
+        self.status_icon.setAlignment(Qt.AlignCenter)
+        status_layout.addWidget(self.status_icon)
+        status_text = QVBoxLayout()
+        status_text.setSpacing(4)
+        self.status_title = QLabel()
+        self.status_title.setObjectName("statusTitle")
+        self.status_title.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.status_detail = QLabel()
+        self.status_detail.setObjectName("statusDetail")
+        self.status_detail.setWordWrap(True)
+        self.status_detail.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        status_text.addWidget(self.status_title)
+        status_text.addWidget(self.status_detail)
+        status_layout.addLayout(status_text, 1)
+        self.select_btn = QPushButton("Выбрать область")
+        self.select_btn.setObjectName("secondaryButton")
+        self.select_btn.clicked.connect(self.select_region)
+        status_layout.addWidget(self.select_btn)
+        layout.addWidget(self.status_card)
+
+        settings_card = QFrame()
+        settings_card.setObjectName("settingsCard")
+        settings_card.setMinimumHeight(128)
+        settings = QGridLayout(settings_card)
+        settings.setContentsMargins(20, 18, 20, 20)
+        settings.setHorizontalSpacing(18)
+        settings.setVerticalSpacing(9)
+        settings.setColumnStretch(0, 1)
+        settings.setColumnStretch(1, 1)
+        mode_label = QLabel("Режим записи")
+        mode_label.setObjectName("fieldLabel")
+        sound_label = QLabel("Звук")
+        sound_label.setObjectName("fieldLabel")
+        settings.addWidget(mode_label, 0, 0)
+        settings.addWidget(sound_label, 0, 1)
+        self.recording_mode_combo = QComboBox()
+        self.recording_mode_combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        for label, fps in RECORDING_MODES:
+            self.recording_mode_combo.addItem(label, fps)
+        settings.addWidget(self.recording_mode_combo, 1, 0)
+        self.audio_combo = QComboBox()
+        self.audio_combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        sound_labels = ("Без звука", "Звук компьютера", "Микрофон", "Компьютер + микрофон")
+        for index, (_, mode) in enumerate(AUDIO_MODE_LABELS):
+            self.audio_combo.addItem(sound_labels[index], mode)
+        settings.addWidget(self.audio_combo, 1, 1)
+        layout.addWidget(settings_card)
+
+        actions = QHBoxLayout()
+        actions.setContentsMargins(0, 2, 0, 0)
+        actions.setSpacing(12)
+        self.record_btn = QPushButton("Начать запись")
+        self.record_btn.setObjectName("recordButton")
+        self.record_btn.setMinimumWidth(178)
+        self.record_btn.clicked.connect(self.start_recording)
+        self.record_btn.setEnabled(False)
+        actions.addWidget(self.record_btn)
+        self.pause_btn = QPushButton("Пауза")
+        self.pause_btn.setObjectName("secondaryButton")
+        self.pause_btn.clicked.connect(self.toggle_pause)
+        actions.addWidget(self.pause_btn)
+        self.stop_btn = QPushButton("Завершить")
+        self.stop_btn.setObjectName("stopButton")
+        self.stop_btn.clicked.connect(self.stop_recording)
+        actions.addWidget(self.stop_btn)
+        actions.addStretch()
+        self.open_folder_btn = QPushButton("Открыть папку")
+        self.open_folder_btn.setObjectName("quietButton")
+        self.open_folder_btn.clicked.connect(self.open_recordings_folder)
+        actions.addWidget(self.open_folder_btn)
+        layout.addLayout(actions)
+
+        self.shortcuts_label = QLabel(
+            "Горячие клавиши:  Ctrl+1 запись   •   Ctrl+2 пауза / продолжить   •   "
+            "Ctrl+3 завершить"
+        )
+        self.shortcuts_label.setObjectName("shortcuts")
+        self.shortcuts_label.setWordWrap(True)
+        self.shortcuts_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        layout.addWidget(self.shortcuts_label)
+
+        layout.addStretch(1)
+        footer_row = QFrame()
+        footer_row.setObjectName("footerRow")
+        footer_layout = QHBoxLayout(footer_row)
+        footer_layout.setContentsMargins(0, 13, 0, 0)
+        footer_layout.setSpacing(10)
+        footer_accent = QLabel("◆")
+        footer_accent.setObjectName("footerAccent")
+        footer_layout.addWidget(footer_accent, 0, Qt.AlignTop)
+        footer = QLabel("Записи сохраняются в папку «Мои записи» рядом с приложением.")
+        footer.setObjectName("footer")
+        footer.setWordWrap(True)
+        footer_layout.addWidget(footer, 1)
+        layout.addWidget(footer_row)
+
+        self.setStyleSheet(self._approved_stylesheet())
+        self._set_status("select", "Выберите область экрана", "Выделите область будущей записи.")
+        self._set_recording_actions(False)
+
+    def _approved_stylesheet(self):
+        arrow_path = bundled_resource_path("chevron-down.svg").as_posix()
+        return (
+            "QMainWindow, QWidget#appRoot { background: #F6F3EE; color: #202B38; }"
+            "QLabel { background: transparent; color: #202B38; }"
+            "QLabel#appTitle { font-size: 21pt; font-weight: 600; color: #202B38; }"
+            "QLabel#appSubtitle, QLabel#statusDetail, QLabel#shortcuts, QLabel#footer { color: #5F6B78; }"
+            "QLabel#appSubtitle { font-size: 10.5pt; }"
+            "QFrame#statusCard { border: 1px solid #D6E1EB; border-left: 4px solid #2C5B86; border-radius: 12px; background: #EDF3F8; }"
+            "QFrame#statusCard[status='recording'] { border-color: #EBC8C5; border-left-color: #B83830; background: #FBEFEE; }"
+            "QFrame#statusCard[status='paused'] { border-color: #E6D6BC; border-left-color: #C69450; background: #FBF6EC; }"
+            "QFrame#statusCard[status='saved'] { border-color: #CFE3D6; border-left-color: #2E7D5B; background: #EDF6F0; }"
+            "QFrame#statusCard[status='error'] { border-color: #EBC8C5; border-left-color: #B83830; background: #FBEFEE; }"
+            "QLabel#statusIcon { min-width: 40px; max-width: 40px; min-height: 40px; max-height: 40px; border-radius: 20px; background: #2C5B86; color: white; font-size: 14pt; font-weight: 600; }"
+            "QFrame#statusCard[status='recording'] QLabel#statusIcon, QFrame#statusCard[status='error'] QLabel#statusIcon { background: #B83830; }"
+            "QFrame#statusCard[status='paused'] QLabel#statusIcon { background: #C69450; }"
+            "QFrame#statusCard[status='saved'] QLabel#statusIcon { background: #2E7D5B; }"
+            "QLabel#statusTitle { font-size: 12pt; font-weight: 600; }"
+            "QLabel#statusDetail { font-size: 10pt; }"
+            "QFrame#settingsCard { border: 1px solid #D7D3CC; border-radius: 12px; background: #FFFDF9; }"
+            "QLabel#fieldLabel { color: #364454; font-size: 10.5pt; font-weight: 600; }"
+            "QLabel#shortcuts { font-size: 10pt; }"
+            "QFrame#footerRow { border-top: 1px solid #DEDAD4; background: transparent; }"
+            "QLabel#footerAccent { color: #C69450; font-size: 10pt; }"
+            "QLabel#footer { color: #5F6B78; font-size: 10pt; }"
+            "QPushButton, QComboBox { font-family: 'Segoe UI'; font-size: 10.5pt; }"
+            "QComboBox { min-height: 44px; padding: 0 34px 0 13px; border: 1px solid #AEB6BF; border-radius: 9px; background: #FFFFFF; color: #202B38; }"
+            "QComboBox::drop-down { subcontrol-origin: padding; subcontrol-position: top right; width: 34px; border: 0; background: transparent; }"
+            f'QComboBox::down-arrow {{ image: url("{arrow_path}"); width: 10px; height: 6px; }}'
+            "QComboBox:hover { border-color: #7E8D9C; }"
+            "QComboBox:focus { border: 2px solid #2C5B86; }"
+            "QComboBox:disabled { background: #EEECE8; color: #8D8A86; border-color: #D7D3CC; }"
+            "QComboBox QAbstractItemView { background: #FFFFFF; color: #202B38; border: 1px solid #AEB6BF; selection-background-color: #E5EEF6; selection-color: #202B38; padding: 5px; outline: 0; }"
+            "QPushButton { min-height: 44px; padding: 0 18px; border: 1px solid #AAB3BD; border-radius: 10px; background: #FFFFFF; color: #263B52; font-weight: 600; }"
+            "QPushButton#recordButton, QPushButton#stopButton { background: #B83830; color: white; border: 1px solid #B83830; }"
+            "QPushButton#recordButton:hover, QPushButton#stopButton:hover { background: #A52F29; }"
+            "QPushButton#secondaryButton { background: #FFFFFF; color: #263B52; border: 1px solid #AAB3BD; }"
+            "QPushButton#secondaryButton:hover { background: #F2F5F7; }"
+            "QPushButton#quietButton, QPushButton#helpButton { background: transparent; color: #263B52; border: 1px solid transparent; }"
+            "QPushButton#quietButton:hover, QPushButton#helpButton:hover { background: #ECE9E4; }"
+            "QPushButton#helpButton { min-width: 44px; max-width: 44px; padding: 0; border-color: #D7D3CC; background: #FFFDF9; }"
+            "QPushButton:disabled, QPushButton#recordButton:disabled, QPushButton#stopButton:disabled, "
+            "QPushButton#secondaryButton:disabled, QPushButton#quietButton:disabled { "
+            "background: #E6E3DE; color: #8D8A86; border-color: #D8D4CE; }"
+        )
+
+    def _set_status(self, state, title, detail=""):
+        icons = {"select": "1", "ready": "✓", "recording": "●", "paused": "Ⅱ", "saving": "…", "saved": "✓", "error": "!"}
+        self.status_card.setProperty("status", state)
+        for widget in (self.status_card, self.status_icon):
+            widget.style().unpolish(widget)
+            widget.style().polish(widget)
+        self.status_icon.setText(icons.get(state, "i"))
+        self.status_title.setText(title)
+        self.status_detail.setText(detail)
+
+    def _set_recording_actions(self, recording):
+        self.select_btn.setVisible(not recording)
+        self.record_btn.setVisible(not recording)
+        self.pause_btn.setVisible(recording)
+        self.stop_btn.setVisible(recording)
+
     def init_hotkeys(self):
         try:
             import keyboard
@@ -848,13 +933,13 @@ class ScreenRecorder(QMainWindow):
         except ImportError:
             # Если модуль не установлен – просто работаем без глобальных хоткеев
             self.keyboard = None
-            self.status_label.setText(
-                "Горячие клавиши недоступны: установите пакет 'keyboard' (pip install keyboard)"
+            self.shortcuts_label.setText(
+                "Горячие клавиши недоступны — используйте кнопки приложения."
             )
 
     def select_region(self):
+        self._set_status("select", "Выберите область экрана", "Esc отменяет выбор области.")
         self._debug_selection_state("select button handler entered")
-        self.status_label.setText("📌 Выбирайте область... (ESC для отмены)")
         if self.selector_overlay and self.selector_overlay.isVisible():
             self._debug_selection_state("existing selector is still visible")
             return
@@ -863,6 +948,7 @@ class ScreenRecorder(QMainWindow):
             self._dispose_selector(self.selector_overlay)
 
         self.select_btn.setEnabled(False)
+        self.record_btn.setEnabled(False)
         self.selector_overlay = RegionSelectorOverlay()
         self.selector_overlay.selection_made.connect(self.on_region_selected)
         self.selector_overlay.selection_canceled.connect(self.on_region_selection_canceled)
@@ -878,7 +964,8 @@ class ScreenRecorder(QMainWindow):
         )
         try:
             self.recording_rect = (x, y, w, h)
-            self.status_label.setText(f"✅ Выбрана область: {w}×{h} пикселей. Готово к записи.")
+            self._set_status("ready", "Готово к записи", f"Выбрана область {w} × {h} px.")
+            self.select_btn.setText("Изменить область")
             self.record_btn.setEnabled(True)
 
             if self.border_window:
@@ -893,7 +980,7 @@ class ScreenRecorder(QMainWindow):
                 repr(exc),
                 traceback.format_exc(),
             )
-            self.status_label.setText(f"Selection failed: {exc}")
+            self._set_status("error", "Не удалось выбрать область", str(exc))
         finally:
             self._finish_region_selection(selector)
 
@@ -901,7 +988,19 @@ class ScreenRecorder(QMainWindow):
         selector = self.selector_overlay
         self._debug_selection_state("selection canceled")
         try:
-            self.status_label.setText("Selection canceled.")
+            if self.recording_rect is None:
+                self._set_status(
+                    "select",
+                    "Выберите область экрана",
+                    "Выбор отменён. Рамка покажет, какая часть экрана попадёт в видео.",
+                )
+            else:
+                width, height = self.recording_rect[2:]
+                self._set_status(
+                    "ready",
+                    "Готово к записи",
+                    f"Выбор отменён. Сохранена область {width} × {height} px.",
+                )
             self.record_btn.setEnabled(self.recording_rect is not None)
         finally:
             self._finish_region_selection(selector)
@@ -986,7 +1085,11 @@ class ScreenRecorder(QMainWindow):
             return
 
         if not self.recording_rect:
-            self.status_label.setText("❌ Сначала выберите область!")
+            self._set_status(
+                "select",
+                "Сначала выберите область экрана",
+                "После выбора станет доступна кнопка «Начать запись».",
+            )
             return
 
         self.recording = True
@@ -996,10 +1099,12 @@ class ScreenRecorder(QMainWindow):
         self.stop_btn.setEnabled(True)
         self.select_btn.setEnabled(False)
         self.audio_combo.setEnabled(False)
+        self.recording_mode_combo.setEnabled(False)
+        self._set_recording_actions(True)
 
         # Создать папку для сохранения.  Новое название папки — 'Мои записи'
-        recordings_dir = Path("Мои записи")
-        recordings_dir.mkdir(exist_ok=True)
+        recordings_dir = recordings_directory()
+        recordings_dir.mkdir(parents=True, exist_ok=True)
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         # Имя временного файла для записи.  Используем расширение .mp4 для
@@ -1012,10 +1117,7 @@ class ScreenRecorder(QMainWindow):
         self.final_output_path = recordings_dir / final_video_filename
         output_file = self.temp_output_path
 
-        # Получить FPS из комбо
-        fps_map = {0: 30, 1: 24, 2: 15}
-        fps = fps_map.get(self.quality_combo.currentIndex(), 30)
-        self.fps_spin.setValue(fps)
+        fps = self.recording_mode_combo.currentData() or 30
 
         debug_print("\n" + "=" * 60)
         debug_print("НАЧАЛО НОВОЙ ЗАПИСИ")
@@ -1040,7 +1142,9 @@ class ScreenRecorder(QMainWindow):
             self.stop_btn.setEnabled(False)
             self.select_btn.setEnabled(True)
             self.audio_combo.setEnabled(True)
-            self.status_label.setText(f"❌ Ошибка звука: {exc}")
+            self.recording_mode_combo.setEnabled(True)
+            self._set_recording_actions(False)
+            self._set_status("error", "Не удалось начать запись", str(exc))
             return
 
         self.recorder_thread = RecorderThread(
@@ -1062,8 +1166,10 @@ class ScreenRecorder(QMainWindow):
         self.showMinimized()
         self._debug_selection_state("main window minimized for recording")
 
-        self.status_label.setText(
-            f"⏺️ ЗАПИСЬ в процессе... {self.recording_rect[2]}×{self.recording_rect[3]}px @ {fps} FPS"
+        self._set_status(
+            "recording",
+            "Идёт запись",
+            f"Запись области {self.recording_rect[2]} × {self.recording_rect[3]} px, {fps} FPS.",
         )
 
     def toggle_pause(self):
@@ -1075,19 +1181,19 @@ class ScreenRecorder(QMainWindow):
         if self.audio_session is not None:
             self.audio_session.set_paused(self.paused)
         if self.paused:
-            self.pause_btn.setText("⏯️ Продолжить")
-            # Update status text with new hotkey (Ctrl+2) for resume
-            self.status_label.setText("⏸️ ПАУЗА - нажмите 'Продолжить' или Ctrl+2")
+            self.pause_btn.setText("Продолжить")
+            self._set_status("paused", "Запись приостановлена", "Нажмите Ctrl+2 или «Продолжить», чтобы продолжить.")
             debug_print("⏸️ Запись поставлена на паузу")
         else:
-            self.pause_btn.setText("⏸️ Пауза")
-            self.status_label.setText("⏺️ ЗАПИСЬ продолжается...")
+            self.pause_btn.setText("Пауза")
+            self._set_status("recording", "Идёт запись", "Запись продолжается.")
             debug_print("▶️ Запись продолжается")
 
     def stop_recording(self):
         if self.recorder_thread and self.recorder_thread.is_recording:
             self.recorder_thread.is_recording = False
-            self.status_label.setText("⏹️ Завершение записи... (пожалуйста, ждите)")
+            self._set_status("saving", "Сохранение видео", "Пожалуйста, подождите.")
+            self.pause_btn.setEnabled(False)
             self.stop_btn.setEnabled(False)
             debug_print("⏹️ Остановка записи...")
 
@@ -1107,10 +1213,13 @@ class ScreenRecorder(QMainWindow):
         self.recording = False
         self.record_btn.setEnabled(True)
         self.pause_btn.setEnabled(False)
-        self.stop_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
         self.select_btn.setEnabled(True)
         self.audio_combo.setEnabled(True)
-        self.pause_btn.setText("⏸️ Пауза")
+        self.recording_mode_combo.setEnabled(True)
+        self.pause_btn.setText("Пауза")
+        self._set_recording_actions(False)
+        self._set_status("saving", "Сохранение видео", "Подготавливаем итоговый MP4.")
         self._debug_selection_state("recording finished")
 
         if self.border_window:
@@ -1127,14 +1236,22 @@ class ScreenRecorder(QMainWindow):
                 debug_print(f"Audio stop failed: {exc}")
 
         if not self.recorder_thread or not self.recorder_thread.output_path:
-            self.status_label.setText("❌ Ошибка при сохранении!")
+            self._set_status(
+                "error",
+                "Ошибка сохранения",
+                "Не найден путь к временному видео.",
+            )
             self.audio_session = None
             return
 
         raw_path = Path(self.recorder_thread.output_path)
         final_path = Path(self.final_output_path)
         if not raw_path.exists():
-            self.status_label.setText("❌ Файл не найден!")
+            self._set_status(
+                "error",
+                "Ошибка сохранения",
+                f"Не найден временный файл: {raw_path.name}.",
+            )
             debug_print(f"Raw video file not found: {raw_path}")
             self.audio_session = None
             return
@@ -1170,30 +1287,38 @@ class ScreenRecorder(QMainWindow):
 
             size_mb = final_path.stat().st_size / (1024 * 1024)
             if audio_error is not None:
-                self.status_label.setText(
-                    f"⚠️ Видео сохранено без звука ({size_mb:.1f} MB): {audio_error}"
+                self._set_status(
+                    "saved",
+                    "Запись сохранена",
+                    f"{final_path.name} ({size_mb:.1f} МБ) — без звука.",
                 )
             else:
-                self.status_label.setText(
-                    f"✅ ГОТОВО! Видео сохранено ({size_mb:.1f} MB) в формате H.264."
+                self._set_status(
+                    "saved",
+                    "Запись сохранена",
+                    f"{final_path.name} ({size_mb:.1f} МБ)",
                 )
         except (MediaMuxError, OSError) as exc:
             debug_print(f"Recording mux failed: {exc}")
-            self.status_label.setText(
-                f"❌ Ошибка сохранения: {exc}. Временные файлы сохранены."
+            self._set_status(
+                "error",
+                "Ошибка сохранения",
+                f"{exc}. Временные файлы сохранены.",
             )
         finally:
             self.audio_session = None
 
     def on_recording_error(self, error_msg):
         debug_print(f"❌ {error_msg}\n")
-        self.status_label.setText(f"❌ {error_msg}")
         self.recording = False
         self.record_btn.setEnabled(True)
         self.pause_btn.setEnabled(False)
         self.stop_btn.setEnabled(False)
         self.select_btn.setEnabled(True)
         self.audio_combo.setEnabled(True)
+        self.recording_mode_combo.setEnabled(True)
+        self._set_recording_actions(False)
+        self._set_status("error", "Ошибка записи", error_msg)
         self.recorder_thread = None
 
         if self.audio_session is not None:
@@ -1212,10 +1337,20 @@ class ScreenRecorder(QMainWindow):
         self.help_window = HelpWindow()
         self.help_window.exec_()
 
+    def open_recordings_folder(self):
+        directory = recordings_directory()
+        directory.mkdir(parents=True, exist_ok=True)
+        try:
+            os.startfile(str(directory))
+        except OSError as exc:
+            self._set_status("error", "Не удалось открыть папку", str(exc))
+
 
 if __name__ == "__main__":
     enable_dpi_awareness()
+    set_windows_app_user_model_id()
     app = QApplication(sys.argv)
+    app.setWindowIcon(QIcon(str(bundled_resource_path("screen-recorder-icon.ico"))))
     window = ScreenRecorder()
     window.show()
     sys.exit(app.exec_())

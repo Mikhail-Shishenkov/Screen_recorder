@@ -1,7 +1,15 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 import shutil
+from pathlib import Path
 
+
+project_dir = Path(SPECPATH)
+icon_path = project_dir / 'screen-recorder-icon.ico'
+if not icon_path.is_file():
+    icon_path = project_dir / 'assets' / 'screen-recorder-icon.ico'
+if not icon_path.is_file():
+    raise RuntimeError('screen-recorder-icon.ico was not found')
 
 ffmpeg_path = shutil.which('ffmpeg')
 if not ffmpeg_path:
@@ -11,7 +19,11 @@ a = Analysis(
     ['screen_recorder.py'],
     pathex=[],
     binaries=[(ffmpeg_path, '.')],
-    datas=[('spider-man-dance.gif', '.')],
+    datas=[
+        ('spider-man-dance.gif', '.'),
+        (str(icon_path), '.'),
+        ('assets/chevron-down.svg', '.'),
+    ],
     hiddenimports=[
         'pyaudiowpatch',
         '_portaudiowpatch',
@@ -45,4 +57,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=str(icon_path),
 )

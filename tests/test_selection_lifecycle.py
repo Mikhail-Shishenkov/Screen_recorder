@@ -8,7 +8,7 @@ from PyQt5.QtCore import QCoreApplication, QEvent
 from PyQt5.QtWidgets import QApplication
 
 from audio_capture import AudioCaptureError
-from screen_recorder import ScreenRecorder
+from screen_recorder import RECORDING_MODES, ScreenRecorder, bundled_resource_path
 
 
 class FakeSignal:
@@ -207,6 +207,46 @@ class SelectionLifecycleTests(unittest.TestCase):
         worker.complete()
         self.app.processEvents()
         self.assertFalse(self.recorder.recording)
+
+    def test_recording_mode_replaces_duplicate_fps_and_quality_controls(self):
+        self.assertFalse(hasattr(self.recorder, "fps_spin"))
+        self.assertFalse(hasattr(self.recorder, "quality_combo"))
+        self.assertEqual(
+            [self.recorder.recording_mode_combo.itemData(index)
+             for index in range(self.recorder.recording_mode_combo.count())],
+            [fps for _, fps in RECORDING_MODES],
+        )
+        self.assertTrue(self.recorder.open_folder_btn.isEnabled())
+        self.assertLessEqual(self.recorder.minimumSizeHint().width(), 800)
+
+    def test_approved_icon_is_available_to_the_main_window(self):
+        self.assertTrue(bundled_resource_path("screen-recorder-icon.ico").is_file())
+        self.assertFalse(self.recorder.windowIcon().isNull())
+
+    def test_recording_controls_disable_and_restore_the_mode_selector(self):
+        self.recorder.recording_rect = (10, 20, 100, 100)
+        self.recorder.record_btn.setEnabled(True)
+        session = FakeAudioSession()
+
+        with patch("screen_recorder.AudioSession", return_value=session):
+            self.recorder.record_btn.click()
+
+        self.assertFalse(self.recorder.recording_mode_combo.isEnabled())
+        worker = self.recorder.recorder_thread
+        self.recorder.stop_btn.click()
+        worker.complete()
+        self.app.processEvents()
+        self.assertTrue(self.recorder.recording_mode_combo.isEnabled())
+
+    def test_open_recordings_folder_uses_portable_recordings_directory(self):
+        with patch("screen_recorder.recordings_directory") as directory_mock, patch(
+            "screen_recorder.os.startfile", create=True
+        ) as startfile_mock:
+            directory = directory_mock.return_value
+            self.recorder.open_recordings_folder()
+
+        directory.mkdir.assert_called_once_with(parents=True, exist_ok=True)
+        startfile_mock.assert_called_once_with(str(directory))
 
 
 if __name__ == "__main__":
