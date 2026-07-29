@@ -7,12 +7,31 @@ from pathlib import Path
 from audio_capture import AUDIO_MICROPHONE, AUDIO_SYSTEM
 
 SYSTEM_MIX_GAIN_DB = -3.0
-MICROPHONE_MIX_GAIN_DB = 0.0
-MIX_LIMIT = 0.95
+MICROPHONE_MUX_GAIN_DB = 10.0
+MICROPHONE_MIX_GAIN_DB = MICROPHONE_MUX_GAIN_DB
+MIX_LIMIT = 0.891251
 
 
 class MediaMuxError(RuntimeError):
     pass
+
+
+def build_peak_limiter():
+    return (
+        f"alimiter=limit={MIX_LIMIT}:attack=5:release=50:"
+        "level=false:latency=true"
+    )
+
+
+def build_microphone_audio_filter(input_index):
+    return (
+        f"[{input_index}:a]"
+        "aresample=48000,"
+        "aformat=sample_fmts=fltp:channel_layouts=stereo,"
+        f"volume={MICROPHONE_MUX_GAIN_DB}dB,"
+        f"{build_peak_limiter()},"
+        "apad[aout]"
+    )
 
 
 def build_mixed_audio_filter(system_index, microphone_index):
@@ -27,8 +46,7 @@ def build_mixed_audio_filter(system_index, microphone_index):
         f"volume={MICROPHONE_MIX_GAIN_DB}dB[microphone];"
         "[system][microphone]"
         "amix=inputs=2:duration=longest:dropout_transition=0:normalize=0,"
-        f"alimiter=limit={MIX_LIMIT}:attack=5:release=50:"
-        "level=false:latency=true,"
+        f"{build_peak_limiter()},"
         "apad[aout]"
     )
 
@@ -71,12 +89,15 @@ def build_mux_command(
         return command
 
     if len(audio_tracks) == 1:
-        filter_graph = (
-            "[1:a]"
-            "aresample=48000,"
-            "aformat=sample_fmts=fltp:channel_layouts=stereo,"
-            "apad[aout]"
-        )
+        if audio_tracks[0].source == AUDIO_MICROPHONE:
+            filter_graph = build_microphone_audio_filter(1)
+        else:
+            filter_graph = (
+                "[1:a]"
+                "aresample=48000,"
+                "aformat=sample_fmts=fltp:channel_layouts=stereo,"
+                "apad[aout]"
+            )
     else:
         source_indexes = {
             track.source: index

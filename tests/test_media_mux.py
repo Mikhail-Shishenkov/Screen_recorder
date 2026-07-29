@@ -15,7 +15,9 @@ from audio_capture import (
 )
 from media_mux import (
     MIX_LIMIT,
+    MICROPHONE_MUX_GAIN_DB,
     MediaMuxError,
+    build_microphone_audio_filter,
     build_mixed_audio_filter,
     build_mux_command,
     find_ffmpeg,
@@ -79,8 +81,44 @@ class MediaMuxTests(unittest.TestCase):
         self.assertNotIn("libx264", command)
         self.assertIn("+faststart", command)
         self.assertNotIn("aac", command)
+        self.assertEqual(
+            command,
+            [
+                "ffmpeg.exe",
+                "-y",
+                "-i",
+                "raw.mkv",
+                "-map",
+                "0:v:0",
+                "-an",
+                "-c:v",
+                "copy",
+                "-movflags",
+                "+faststart",
+                "final.mp4",
+            ],
+        )
 
-    def test_microphone_mux_uses_aac_and_explicit_output_format(self):
+    def test_system_mux_does_not_apply_microphone_gain_or_limiter(self):
+        track = make_track(AUDIO_SYSTEM, Path("system.wav"))
+        command = build_mux_command(
+            "ffmpeg.exe",
+            "raw.mkv",
+            "final.mp4",
+            [track],
+        )
+
+        filter_graph = command[command.index("-filter_complex") + 1]
+        self.assertEqual(
+            filter_graph,
+            "[1:a]aresample=48000,"
+            "aformat=sample_fmts=fltp:channel_layouts=stereo,"
+            "apad[aout]",
+        )
+        self.assertNotIn("volume=", filter_graph)
+        self.assertNotIn("alimiter=", filter_graph)
+
+    def test_microphone_mux_applies_gain_then_peak_limiter(self):
         track = make_track(AUDIO_MICROPHONE, Path("microphone.wav"))
         command = build_mux_command(
             "ffmpeg.exe",
@@ -102,6 +140,18 @@ class MediaMuxTests(unittest.TestCase):
         self.assertIn("aresample=48000", filter_graph)
         self.assertIn("channel_layouts=stereo", filter_graph)
         self.assertIn("apad", filter_graph)
+        gain_filter = f"volume={MICROPHONE_MUX_GAIN_DB}dB"
+        limiter_filter = f"alimiter=limit={MIX_LIMIT}"
+        self.assertIn(gain_filter, filter_graph)
+        self.assertIn(limiter_filter, filter_graph)
+        self.assertLess(
+            filter_graph.index(gain_filter),
+            filter_graph.index(limiter_filter),
+        )
+        self.assertLess(
+            filter_graph.index(limiter_filter),
+            filter_graph.index("apad"),
+        )
 
     def test_mixed_mux_uses_independent_gains_without_amix_attenuation(self):
         tracks = [
@@ -119,10 +169,38 @@ class MediaMuxTests(unittest.TestCase):
         self.assertIn("[1:a]", filter_graph)
         self.assertIn("[2:a]", filter_graph)
         self.assertIn("volume=-3.0dB[system]", filter_graph)
-        self.assertIn("volume=0.0dB[microphone]", filter_graph)
+        self.assertIn(
+            f"volume={MICROPHONE_MUX_GAIN_DB}dB[microphone]",
+            filter_graph,
+        )
+        self.assertNotIn("volume=10.0dB[system]", filter_graph)
         self.assertIn("amix=inputs=2", filter_graph)
         self.assertIn("normalize=0", filter_graph)
-        self.assertIn("alimiter=limit=0.95", filter_graph)
+        self.assertIn(f"alimiter=limit={MIX_LIMIT}", filter_graph)
+        self.assertLess(
+            filter_graph.index(
+                f"volume={MICROPHONE_MUX_GAIN_DB}dB[microphone]"
+            ),
+            filter_graph.index("amix=inputs=2"),
+        )
+        self.assertLess(
+            filter_graph.index("amix=inputs=2"),
+            filter_graph.index(f"alimiter=limit={MIX_LIMIT}"),
+        )
+
+    def test_audio_paths_with_spaces_and_apostrophes_are_single_arguments(self):
+        audio_path = Path("C:/Audio devices/user's microphone.wav")
+        track = make_track(AUDIO_MICROPHONE, audio_path)
+        command = build_mux_command(
+            "ffmpeg.exe",
+            "raw video.mkv",
+            "final video.mp4",
+            [track],
+        )
+
+        self.assertIn(str(audio_path), command)
+        self.assertEqual(command.count(str(audio_path)), 1)
+        self.assertEqual(command[command.index("-i", 3) + 1], str(audio_path))
 
     def test_mux_invokes_ffmpeg_and_requires_output_file(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -215,6 +293,96 @@ class MediaMuxTests(unittest.TestCase):
             np.percentile(jumps[boundary_indexes], 99),
             np.percentile(jumps[interior_mask], 99) * 2,
         )
+
+    def test_real_microphone_filter_adds_ten_db_without_clipping(self):
+        ffmpeg = find_ffmpeg()
+        sample_rate = 48000
+        duration = 0.25
+        frame_count = round(sample_rate * duration)
+        time_axis = np.arange(frame_count) / sample_rate
+        microphone = 0.05 * np.sin(2 * np.pi * 880 * time_axis)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            microphone_path = Path(temp_dir) / "microphone.wav"
+            with wave.open(str(microphone_path), "wb") as wav_file:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(sample_rate)
+                wav_file.writeframes(
+                    np.rint(microphone * 32767).astype("<i2").tobytes()
+                )
+            def run_filter(filter_graph):
+                return subprocess.run(
+                    [
+                        ffmpeg,
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-i",
+                        str(microphone_path),
+                        "-filter_complex",
+                        filter_graph,
+                        "-map",
+                        "[aout]",
+                        "-t",
+                        str(duration),
+                        "-f",
+                        "f32le",
+                        "-acodec",
+                        "pcm_f32le",
+                        "pipe:1",
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=True,
+                ).stdout
+
+            baseline_bytes = run_filter(
+                "[0:a]aresample=48000,"
+                "aformat=sample_fmts=fltp:channel_layouts=stereo,"
+                "apad[aout]"
+            )
+            processed_bytes = run_filter(
+                build_microphone_audio_filter(0)
+            )
+
+        baseline = np.frombuffer(baseline_bytes, dtype="<f4")
+        processed = np.frombuffer(processed_bytes, dtype="<f4")
+        input_rms = float(np.sqrt(np.mean(np.square(baseline))))
+        output_rms = float(np.sqrt(np.mean(np.square(processed))))
+        gain_db = 20.0 * np.log10(output_rms / input_rms)
+        self.assertAlmostEqual(gain_db, MICROPHONE_MUX_GAIN_DB, delta=0.2)
+        self.assertLessEqual(
+            float(np.max(np.abs(processed))),
+            MIX_LIMIT + 0.002,
+        )
+
+    def test_mux_error_is_reported_and_does_not_delete_inputs(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            raw_path = Path(temp_dir) / "raw.mkv"
+            final_path = Path(temp_dir) / "final.mp4"
+            raw_path.write_bytes(b"raw")
+
+            with patch(
+                "media_mux.find_ffmpeg",
+                return_value="ffmpeg.exe",
+            ), patch(
+                "media_mux.subprocess.run",
+                return_value=subprocess.CompletedProcess(
+                    [],
+                    1,
+                    b"",
+                    b"filter failed",
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    MediaMuxError,
+                    "filter failed",
+                ):
+                    mux_recording(raw_path, final_path, [])
+
+            self.assertTrue(raw_path.exists())
+            self.assertFalse(final_path.exists())
 
     def test_quiet_microphone_is_amplified_without_pcm_clipping(self):
         raw = np.full(4800, 300, dtype="<i2")
