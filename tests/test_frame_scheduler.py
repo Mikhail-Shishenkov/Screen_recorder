@@ -76,22 +76,27 @@ class FakeMssSession:
 
 class FakeVideoWriter:
     def __init__(self):
-        self.released = False
+        self.closed = False
+        self.aborted = False
         self.frames = 0
 
-    def isOpened(self):
-        return True
+    def submit(self, frame, repeat_count=1):
+        self.frames += repeat_count
 
-    def write(self, frame):
-        self.frames += 1
+    def close(self):
+        self.closed = True
 
-    def release(self):
-        self.released = True
+    def abort(self):
+        self.aborted = True
 
 
 class RecorderResourceTests(unittest.TestCase):
     def test_stop_releases_capture_and_writer_resources(self):
-        worker = RecorderThread((0, 0, 100, 100), "resource_test.mp4", 30)
+        worker = RecorderThread(
+            (0, 0, 100, 100),
+            "resource_test.mkv",
+            "maximum",
+        )
         session = FakeMssSession()
         writer = FakeVideoWriter()
 
@@ -102,11 +107,12 @@ class RecorderResourceTests(unittest.TestCase):
         with patch("screen_recorder.mss.mss", return_value=session), patch.object(
             worker, "_capture_frame", side_effect=capture_once
         ), patch.object(worker, "_draw_cursor_and_clicks"), patch(
-            "screen_recorder.cv2.VideoWriter", return_value=writer
-        ), patch("screen_recorder.cv2.VideoWriter_fourcc", return_value=0):
+            "screen_recorder.FFmpegVideoWriter", return_value=writer
+        ):
             worker.run()
 
-        self.assertTrue(writer.released)
+        self.assertTrue(writer.closed)
+        self.assertFalse(writer.aborted)
         self.assertTrue(session.closed)
         self.assertIsNone(worker.video_writer)
         self.assertFalse(worker.is_recording)

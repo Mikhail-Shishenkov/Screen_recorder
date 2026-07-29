@@ -64,7 +64,7 @@ def build_mux_command(
 
     command.extend(["-map", "0:v:0"])
     if not audio_tracks:
-        command.extend(["-an", "-c:v", "libx264", "-pix_fmt", "yuv420p"])
+        command.extend(["-an", "-c:v", "copy"])
         if output_duration is not None:
             command.extend(["-t", f"{output_duration:.6f}"])
         command.extend(["-movflags", "+faststart", str(final_video)])
@@ -96,9 +96,7 @@ def build_mux_command(
             "-map",
             "[aout]",
             "-c:v",
-            "libx264",
-            "-pix_fmt",
-            "yuv420p",
+            "copy",
             "-c:a",
             "aac",
             "-b:a",

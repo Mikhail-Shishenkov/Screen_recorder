@@ -20,16 +20,27 @@ from region_geometry import (
     rect_to_capture_region,
 )
 from frame_scheduler import FrameScheduler
-from async_frame_writer import AsyncFrameWriter
 from audio_capture import AUDIO_MODE_LABELS, AudioCaptureError, AudioSession
+from ffmpeg_video_writer import (
+    FFmpegVideoError,
+    FFmpegVideoWriter,
+    VIDEO_PROFILES,
+    get_video_profile,
+)
 from media_mux import MediaMuxError, mux_recording
+from localization import (
+    DEFAULT_LANGUAGE,
+    LANGUAGE_OPTIONS,
+    normalize_language,
+    translate,
+)
 
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout,
     QHBoxLayout, QGridLayout, QPushButton, QLabel, QComboBox, QFrame, QSizePolicy
 )
-from PyQt5.QtCore import pyqtSignal, QThread, Qt, QTimer, QRect
+from PyQt5.QtCore import pyqtSignal, QThread, Qt, QTimer, QRect, QSettings
 
 import platform
 from PyQt5.QtGui import QPainter, QPen, QColor
@@ -37,12 +48,17 @@ from PyQt5.QtGui import QPainter, QPen, QColor
 # === ВКЛ/ВЫКЛ логов в терминал ===
 DEBUG = False
 
-RECORDING_MODES = (
-    ("Для отправки — рекомендуется", 30),
-    ("Максимальное качество", 24),
-    ("Компактный размер", 15),
+RECORDING_MODES = tuple(
+    (f"quality.{profile.key}", profile.key)
+    for profile in VIDEO_PROFILES
 )
 
+AUDIO_MODE_TRANSLATION_KEYS = {
+    "off": "audio.off",
+    "system": "audio.system",
+    "microphone": "audio.microphone",
+    "system_microphone": "audio.system_microphone",
+}
 
 def debug_print(*args, **kwargs):
     if DEBUG:
@@ -169,15 +185,16 @@ class BorderWindow(QWidget):
 
 
 class RecorderThread(QThread):
-    finished = pyqtSignal()
+    completed = pyqtSignal()
     error = pyqtSignal(str)
 
-    def __init__(self, bbox, output_path, fps=30):
+    def __init__(self, bbox, output_path, profile_key="maximum"):
         super().__init__()
         self.bbox = bbox  # (x, y, width, height)
         self.output_path = output_path
-        self.fps = fps              # желаемый FPS (ограничение сверху)
-        self.effective_fps = fps    # фактический FPS, с которым будем писать
+        self.video_profile = get_video_profile(profile_key)
+        self.fps = self.video_profile.fps
+        self.effective_fps = self.video_profile.fps
         self.is_recording = True
         self.is_paused = False
 
@@ -284,11 +301,11 @@ class RecorderThread(QThread):
         )
 
     def run(self):
-        writer = None
         frame_writer = None
         capture_session = None
         scheduler = None
         last_frame = None
+        recording_succeeded = False
         timings = {
             "capture": [],
             "cursor_and_clicks": [],
@@ -343,24 +360,15 @@ class RecorderThread(QThread):
                         time.perf_counter() - overlay_started
                     )
 
-                    if writer is None:
-                        output_path_str = str(self.output_path)
-                        if output_path_str.lower().endswith(".avi"):
-                            fourcc = cv2.VideoWriter_fourcc(*"XVID")
-                        else:
-                            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                    if frame_writer is None:
                         h_frame, w_frame = frame.shape[:2]
-                        writer = cv2.VideoWriter(
-                            output_path_str,
-                            fourcc,
-                            self.effective_fps,
-                            (w_frame, h_frame),
+                        frame_writer = FFmpegVideoWriter(
+                            self.output_path,
+                            w_frame,
+                            h_frame,
+                            self.video_profile,
+                            logger=debug_print,
                         )
-                        if not writer.isOpened():
-                            raise Exception(
-                                "Failed to open VideoWriter; check installed codecs"
-                            )
-                        frame_writer = AsyncFrameWriter(writer)
                         self.video_writer = frame_writer
 
                     due_frames = scheduler.claim_due_frames(time.perf_counter())
@@ -381,6 +389,8 @@ class RecorderThread(QThread):
                     self.missed_frame_count += max(0, due_frames - 1)
                     last_frame = frame
                     timings["frame"].append(time.perf_counter() - frame_started)
+                except FFmpegVideoError:
+                    raise
                 except Exception as exc:
                     debug_print(f"Capture error: {exc}")
                     time.sleep(0.01)
@@ -388,7 +398,7 @@ class RecorderThread(QThread):
             stopped_at = time.perf_counter()
             self.active_recording_seconds = scheduler.active_elapsed(stopped_at)
             target_frames = scheduler.final_frame_count(stopped_at)
-            if writer is not None and last_frame is not None:
+            if frame_writer is not None and last_frame is not None:
                 write_started = time.perf_counter()
                 missing_frames = max(0, target_frames - self.frame_count)
                 if missing_frames:
@@ -416,7 +426,6 @@ class RecorderThread(QThread):
             if frame_writer is not None:
                 frame_writer.close()
                 frame_writer = None
-                writer = None
                 self.video_writer = None
 
             if self.frame_count == 0:
@@ -431,6 +440,7 @@ class RecorderThread(QThread):
                 )
             else:
                 debug_print("Video file was not found after recording")
+            recording_succeeded = True
 
         except Exception as e:
             error_msg = f"Ошибка при записи видео: {str(e)}"
@@ -439,17 +449,16 @@ class RecorderThread(QThread):
         finally:
             if frame_writer is not None:
                 try:
-                    frame_writer.close()
+                    frame_writer.abort()
                 except Exception as exc:
                     debug_print(f"Frame writer close error: {exc}")
-            elif writer is not None:
-                writer.release()
             self.video_writer = None
             if capture_session is not None:
                 capture_session.close()
             self.frames = []
             self.is_recording = False
-            self.finished.emit()
+            if recording_succeeded:
+                self.completed.emit()
 
 
 class RegionSelectorTkinter:
@@ -523,12 +532,25 @@ class RegionSelectorOverlay(QWidget):
     selection_made = pyqtSignal(int, int, int, int)
     selection_canceled = pyqtSignal()
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, messages=None):
         super().__init__(parent)
+        messages = messages or {}
+        self._message_select = messages.get(
+            "select",
+            "Drag to select an area. Esc cancels.",
+        )
+        self._message_release = messages.get(
+            "release",
+            "Release to confirm. Esc cancels.",
+        )
+        self._message_too_small = messages.get(
+            "too_small",
+            "Area must be at least 2x2 px after even rounding.",
+        )
         self.virtual_geometry = get_virtual_screen_geometry()
         self.start_point = None
         self.current_point = None
-        self.message = "Drag to select an area. Esc cancels."
+        self.message = self._message_select
         self._completion_emitted = False
         self._closing = False
 
@@ -571,7 +593,7 @@ class RegionSelectorOverlay(QWidget):
             return
         self.start_point = event.globalPos()
         self.current_point = event.globalPos()
-        self.message = "Release to confirm. Esc cancels."
+        self.message = self._message_release
         self.update()
 
     def mouseMoveEvent(self, event):
@@ -594,7 +616,7 @@ class RegionSelectorOverlay(QWidget):
         if rect is None:
             self.start_point = None
             self.current_point = None
-            self.message = "Area must be at least 2x2 px after even rounding."
+            self.message = self._message_too_small
             self.update()
             return
 
@@ -669,9 +691,9 @@ class RegionSelectorOverlay(QWidget):
 
 
 class HelpWindow(QDialog):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("🕷️ Help from Spider-Man")
+    def __init__(self, title, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
         self.setFixedSize(400, 400)
 
         layout = QVBoxLayout(self)
@@ -687,9 +709,18 @@ class HelpWindow(QDialog):
         self.movie.start()
 
 class ScreenRecorder(QMainWindow):
-    def __init__(self):
+    def __init__(self, settings=None):
         super().__init__()
-        self.setWindowTitle("Screen Recorder Pro")
+        self.settings = settings or QSettings(
+            "ScreenRecorderPro",
+            "ScreenRecorderPro",
+        )
+        stored_language = self.settings.value(
+            "ui/language",
+            DEFAULT_LANGUAGE,
+        )
+        self.current_language = normalize_language(stored_language)
+        self.setWindowTitle(self._t("app.title"))
         app_font = QFont("Segoe UI")
         app_font.setPointSizeF(10.5)
         self.setFont(app_font)
@@ -702,6 +733,11 @@ class ScreenRecorder(QMainWindow):
         self.selector_overlay = None
         self.keyboard = None  # модуль для глобальных хоткеев
         self.audio_session = None
+        self.hotkeys_available = True
+        self._status_state = "select"
+        self._status_title_key = "status.select.title"
+        self._status_detail_key = "status.select.initial"
+        self._status_values = {}
 
         self._build_approved_ui()
         self.init_hotkeys()
@@ -722,19 +758,39 @@ class ScreenRecorder(QMainWindow):
         header = QHBoxLayout()
         heading = QVBoxLayout()
         heading.setSpacing(4)
-        title = QLabel("Screen Recorder Pro")
-        title.setObjectName("appTitle")
-        title.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
-        subtitle = QLabel("Запись выбранной области без лишних настроек")
-        subtitle.setObjectName("appSubtitle")
-        subtitle.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
-        heading.addWidget(title)
-        heading.addWidget(subtitle)
-        header.addLayout(heading)
-        header.addStretch()
+        self.title_label = QLabel()
+        self.title_label.setObjectName("appTitle")
+        self.title_label.setSizePolicy(
+            QSizePolicy.Ignored,
+            QSizePolicy.Preferred,
+        )
+        self.subtitle_label = QLabel()
+        self.subtitle_label.setObjectName("appSubtitle")
+        self.subtitle_label.setWordWrap(True)
+        self.subtitle_label.setSizePolicy(
+            QSizePolicy.Ignored,
+            QSizePolicy.Preferred,
+        )
+        heading.addWidget(self.title_label)
+        heading.addWidget(self.subtitle_label)
+        header.addLayout(heading, 1)
+        self.language_combo = QComboBox()
+        self.language_combo.setObjectName("languageCombo")
+        self.language_combo.setSizePolicy(
+            QSizePolicy.Fixed,
+            QSizePolicy.Fixed,
+        )
+        self.language_combo.setFixedWidth(120)
+        for language, native_name in LANGUAGE_OPTIONS:
+            self.language_combo.addItem(native_name, language)
+        language_index = self.language_combo.findData(self.current_language)
+        self.language_combo.setCurrentIndex(max(0, language_index))
+        self.language_combo.currentIndexChanged.connect(
+            self._on_language_changed
+        )
+        header.addWidget(self.language_combo)
         self.help_btn = QPushButton("?")
         self.help_btn.setObjectName("helpButton")
-        self.help_btn.setToolTip("Справка и Spider-Man")
         self.help_btn.clicked.connect(self.show_help)
         header.addWidget(self.help_btn)
         layout.addLayout(header)
@@ -761,7 +817,7 @@ class ScreenRecorder(QMainWindow):
         status_text.addWidget(self.status_title)
         status_text.addWidget(self.status_detail)
         status_layout.addLayout(status_text, 1)
-        self.select_btn = QPushButton("Выбрать область")
+        self.select_btn = QPushButton()
         self.select_btn.setObjectName("secondaryButton")
         self.select_btn.clicked.connect(self.select_region)
         status_layout.addWidget(self.select_btn)
@@ -776,53 +832,55 @@ class ScreenRecorder(QMainWindow):
         settings.setVerticalSpacing(9)
         settings.setColumnStretch(0, 1)
         settings.setColumnStretch(1, 1)
-        mode_label = QLabel("Режим записи")
-        mode_label.setObjectName("fieldLabel")
-        sound_label = QLabel("Звук")
-        sound_label.setObjectName("fieldLabel")
-        settings.addWidget(mode_label, 0, 0)
-        settings.addWidget(sound_label, 0, 1)
+        self.mode_label = QLabel()
+        self.mode_label.setObjectName("fieldLabel")
+        self.sound_label = QLabel()
+        self.sound_label.setObjectName("fieldLabel")
+        settings.addWidget(self.mode_label, 0, 0)
+        settings.addWidget(self.sound_label, 0, 1)
         self.recording_mode_combo = QComboBox()
         self.recording_mode_combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
-        for label, fps in RECORDING_MODES:
-            self.recording_mode_combo.addItem(label, fps)
+        for translation_key, profile_key in RECORDING_MODES:
+            self.recording_mode_combo.addItem(
+                self._t(translation_key),
+                profile_key,
+            )
         settings.addWidget(self.recording_mode_combo, 1, 0)
         self.audio_combo = QComboBox()
         self.audio_combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
-        sound_labels = ("Без звука", "Звук компьютера", "Микрофон", "Компьютер + микрофон")
-        for index, (_, mode) in enumerate(AUDIO_MODE_LABELS):
-            self.audio_combo.addItem(sound_labels[index], mode)
+        for _, mode in AUDIO_MODE_LABELS:
+            self.audio_combo.addItem(
+                self._t(AUDIO_MODE_TRANSLATION_KEYS[mode]),
+                mode,
+            )
         settings.addWidget(self.audio_combo, 1, 1)
         layout.addWidget(settings_card)
 
         actions = QHBoxLayout()
         actions.setContentsMargins(0, 2, 0, 0)
         actions.setSpacing(12)
-        self.record_btn = QPushButton("Начать запись")
+        self.record_btn = QPushButton()
         self.record_btn.setObjectName("recordButton")
         self.record_btn.setMinimumWidth(178)
         self.record_btn.clicked.connect(self.start_recording)
         self.record_btn.setEnabled(False)
         actions.addWidget(self.record_btn)
-        self.pause_btn = QPushButton("Пауза")
+        self.pause_btn = QPushButton()
         self.pause_btn.setObjectName("secondaryButton")
         self.pause_btn.clicked.connect(self.toggle_pause)
         actions.addWidget(self.pause_btn)
-        self.stop_btn = QPushButton("Завершить")
+        self.stop_btn = QPushButton()
         self.stop_btn.setObjectName("stopButton")
         self.stop_btn.clicked.connect(self.stop_recording)
         actions.addWidget(self.stop_btn)
         actions.addStretch()
-        self.open_folder_btn = QPushButton("Открыть папку")
+        self.open_folder_btn = QPushButton()
         self.open_folder_btn.setObjectName("quietButton")
         self.open_folder_btn.clicked.connect(self.open_recordings_folder)
         actions.addWidget(self.open_folder_btn)
         layout.addLayout(actions)
 
-        self.shortcuts_label = QLabel(
-            "Горячие клавиши:  Ctrl+1 запись   •   Ctrl+2 пауза / продолжить   •   "
-            "Ctrl+3 завершить"
-        )
+        self.shortcuts_label = QLabel()
         self.shortcuts_label.setObjectName("shortcuts")
         self.shortcuts_label.setWordWrap(True)
         self.shortcuts_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
@@ -837,14 +895,19 @@ class ScreenRecorder(QMainWindow):
         footer_accent = QLabel("◆")
         footer_accent.setObjectName("footerAccent")
         footer_layout.addWidget(footer_accent, 0, Qt.AlignTop)
-        footer = QLabel("Записи сохраняются в папку «Мои записи» рядом с приложением.")
-        footer.setObjectName("footer")
-        footer.setWordWrap(True)
-        footer_layout.addWidget(footer, 1)
+        self.footer_label = QLabel()
+        self.footer_label.setObjectName("footer")
+        self.footer_label.setWordWrap(True)
+        footer_layout.addWidget(self.footer_label, 1)
         layout.addWidget(footer_row)
 
         self.setStyleSheet(self._approved_stylesheet())
-        self._set_status("select", "Выберите область экрана", "Выделите область будущей записи.")
+        self.apply_language()
+        self._set_status(
+            "select",
+            "status.select.title",
+            "status.select.initial",
+        )
         self._set_recording_actions(False)
 
     def _approved_stylesheet(self):
@@ -874,7 +937,9 @@ class ScreenRecorder(QMainWindow):
             "QLabel#footer { color: #5F6B78; font-size: 10pt; }"
             "QPushButton, QComboBox { font-family: 'Segoe UI'; font-size: 10.5pt; }"
             "QComboBox { min-height: 44px; padding: 0 34px 0 13px; border: 1px solid #AEB6BF; border-radius: 9px; background: #FFFFFF; color: #202B38; }"
+            "QComboBox#languageCombo { min-height: 40px; max-height: 40px; padding: 0 0 0 9px; font-size: 10pt; }"
             "QComboBox::drop-down { subcontrol-origin: padding; subcontrol-position: top right; width: 34px; border: 0; background: transparent; }"
+            "QComboBox#languageCombo::drop-down { width: 26px; }"
             f'QComboBox::down-arrow {{ image: url("{arrow_path}"); width: 10px; height: 6px; }}'
             "QComboBox:hover { border-color: #7E8D9C; }"
             "QComboBox:focus { border: 2px solid #2C5B86; }"
@@ -893,15 +958,103 @@ class ScreenRecorder(QMainWindow):
             "background: #E6E3DE; color: #8D8A86; border-color: #D8D4CE; }"
         )
 
-    def _set_status(self, state, title, detail=""):
+    def _t(self, key, **values):
+        return translate(self.current_language, key, **values)
+
+    def _on_language_changed(self, index):
+        self.set_language(self.language_combo.itemData(index))
+
+    def set_language(self, language):
+        language = normalize_language(language)
+        self.current_language = language
+        index = self.language_combo.findData(language)
+        if index >= 0 and self.language_combo.currentIndex() != index:
+            self.language_combo.blockSignals(True)
+            self.language_combo.setCurrentIndex(index)
+            self.language_combo.blockSignals(False)
+        self.settings.setValue("ui/language", language)
+        self.settings.sync()
+        self.apply_language()
+
+    def _translate_combo_items(self, combo, key_for_value):
+        current_value = combo.currentData()
+        combo.blockSignals(True)
+        for index in range(combo.count()):
+            value = combo.itemData(index)
+            combo.setItemText(index, self._t(key_for_value(value)))
+        selected_index = combo.findData(current_value)
+        if selected_index >= 0:
+            combo.setCurrentIndex(selected_index)
+        combo.blockSignals(False)
+
+    def apply_language(self):
+        self.setWindowTitle(self._t("app.title"))
+        self.title_label.setText(self._t("app.title"))
+        self.subtitle_label.setText(self._t("app.subtitle"))
+        self.language_combo.setToolTip(self._t("language.tooltip"))
+        self.help_btn.setToolTip(self._t("help.tooltip"))
+        self.mode_label.setText(self._t("field.recording_mode"))
+        self.sound_label.setText(self._t("field.audio"))
+        self.record_btn.setText(self._t("button.start"))
+        self.stop_btn.setText(self._t("button.stop"))
+        self.open_folder_btn.setText(self._t("button.open_folder"))
+        self.select_btn.setText(
+            self._t(
+                "button.change_region"
+                if self.recording_rect is not None
+                else "button.select_region"
+            )
+        )
+        self.pause_btn.setText(
+            self._t(
+                "button.resume"
+                if self.recording and self.paused
+                else "button.pause"
+            )
+        )
+        self.shortcuts_label.setText(
+            self._t(
+                "shortcuts.available"
+                if self.hotkeys_available
+                else "shortcuts.unavailable"
+            )
+        )
+        self.footer_label.setText(self._t("footer.recordings"))
+        self._translate_combo_items(
+            self.recording_mode_combo,
+            lambda value: f"quality.{value}",
+        )
+        self._translate_combo_items(
+            self.audio_combo,
+            lambda value: AUDIO_MODE_TRANSLATION_KEYS[value],
+        )
+        self._render_status()
+
+    def _render_status(self):
+        self.status_title.setText(
+            self._t(self._status_title_key, **self._status_values)
+        )
+        if self._status_detail_key:
+            detail = self._t(
+                self._status_detail_key,
+                **self._status_values,
+            )
+        else:
+            detail = ""
+        self.status_detail.setText(detail)
+
+    def _set_status(self, state, title_key, detail_key="", **values):
+        self._status_state = state
+        self._status_title_key = title_key
+        self._status_detail_key = detail_key
+        self._status_values = values
         icons = {"select": "1", "ready": "✓", "recording": "●", "paused": "Ⅱ", "saving": "…", "saved": "✓", "error": "!"}
         self.status_card.setProperty("status", state)
         for widget in (self.status_card, self.status_icon):
             widget.style().unpolish(widget)
             widget.style().polish(widget)
         self.status_icon.setText(icons.get(state, "i"))
-        self.status_title.setText(title)
-        self.status_detail.setText(detail)
+        self._render_status()
 
     def _set_recording_actions(self, recording):
         self.select_btn.setVisible(not recording)
@@ -933,12 +1086,15 @@ class ScreenRecorder(QMainWindow):
         except ImportError:
             # Если модуль не установлен – просто работаем без глобальных хоткеев
             self.keyboard = None
-            self.shortcuts_label.setText(
-                "Горячие клавиши недоступны — используйте кнопки приложения."
-            )
+            self.hotkeys_available = False
+            self.shortcuts_label.setText(self._t("shortcuts.unavailable"))
 
     def select_region(self):
-        self._set_status("select", "Выберите область экрана", "Esc отменяет выбор области.")
+        self._set_status(
+            "select",
+            "status.select.title",
+            "status.select.overlay",
+        )
         self._debug_selection_state("select button handler entered")
         if self.selector_overlay and self.selector_overlay.isVisible():
             self._debug_selection_state("existing selector is still visible")
@@ -949,7 +1105,13 @@ class ScreenRecorder(QMainWindow):
 
         self.select_btn.setEnabled(False)
         self.record_btn.setEnabled(False)
-        self.selector_overlay = RegionSelectorOverlay()
+        self.selector_overlay = RegionSelectorOverlay(
+            messages={
+                "select": self._t("overlay.select"),
+                "release": self._t("overlay.release"),
+                "too_small": self._t("overlay.too_small"),
+            }
+        )
         self.selector_overlay.selection_made.connect(self.on_region_selected)
         self.selector_overlay.selection_canceled.connect(self.on_region_selection_canceled)
         self.selector_overlay.destroyed.connect(self.on_region_selector_closed)
@@ -964,8 +1126,14 @@ class ScreenRecorder(QMainWindow):
         )
         try:
             self.recording_rect = (x, y, w, h)
-            self._set_status("ready", "Готово к записи", f"Выбрана область {w} × {h} px.")
-            self.select_btn.setText("Изменить область")
+            self._set_status(
+                "ready",
+                "status.ready.title",
+                "status.ready.selected",
+                width=w,
+                height=h,
+            )
+            self.select_btn.setText(self._t("button.change_region"))
             self.record_btn.setEnabled(True)
 
             if self.border_window:
@@ -980,7 +1148,12 @@ class ScreenRecorder(QMainWindow):
                 repr(exc),
                 traceback.format_exc(),
             )
-            self._set_status("error", "Не удалось выбрать область", str(exc))
+            self._set_status(
+                "error",
+                "status.selection_error.title",
+                "status.selection_error.detail",
+                error=str(exc),
+            )
         finally:
             self._finish_region_selection(selector)
 
@@ -991,15 +1164,17 @@ class ScreenRecorder(QMainWindow):
             if self.recording_rect is None:
                 self._set_status(
                     "select",
-                    "Выберите область экрана",
-                    "Выбор отменён. Рамка покажет, какая часть экрана попадёт в видео.",
+                    "status.select.title",
+                    "status.cancelled.empty",
                 )
             else:
                 width, height = self.recording_rect[2:]
                 self._set_status(
                     "ready",
-                    "Готово к записи",
-                    f"Выбор отменён. Сохранена область {width} × {height} px.",
+                    "status.ready.title",
+                    "status.cancelled.saved",
+                    width=width,
+                    height=height,
                 )
             self.record_btn.setEnabled(self.recording_rect is not None)
         finally:
@@ -1087,8 +1262,8 @@ class ScreenRecorder(QMainWindow):
         if not self.recording_rect:
             self._set_status(
                 "select",
-                "Сначала выберите область экрана",
-                "После выбора станет доступна кнопка «Начать запись».",
+                "status.no_region.title",
+                "status.no_region.detail",
             )
             return
 
@@ -1107,17 +1282,15 @@ class ScreenRecorder(QMainWindow):
         recordings_dir.mkdir(parents=True, exist_ok=True)
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        # Имя временного файла для записи.  Используем расширение .mp4 для
-        # промежуточного файла; OpenCV запишет поток с кодеком mp4v (MPEG-4 Part 2).
-        # После завершения записи при наличии ffmpeg файл будет перекодирован
-        # в H.264, а исходный файл будет переименован.
-        temp_video_filename = f"recording_{timestamp}_raw.mp4"
+        temp_video_filename = f"recording_{timestamp}_video.mkv"
         final_video_filename = f"recording_{timestamp}.mp4"
         self.temp_output_path = recordings_dir / temp_video_filename
         self.final_output_path = recordings_dir / final_video_filename
         output_file = self.temp_output_path
 
-        fps = self.recording_mode_combo.currentData() or 30
+        profile_key = self.recording_mode_combo.currentData() or "tracker"
+        video_profile = get_video_profile(profile_key)
+        fps = video_profile.fps
 
         debug_print("\n" + "=" * 60)
         debug_print("НАЧАЛО НОВОЙ ЗАПИСИ")
@@ -1144,15 +1317,20 @@ class ScreenRecorder(QMainWindow):
             self.audio_combo.setEnabled(True)
             self.recording_mode_combo.setEnabled(True)
             self._set_recording_actions(False)
-            self._set_status("error", "Не удалось начать запись", str(exc))
+            self._set_status(
+                "error",
+                "status.start_error.title",
+                "status.start_error.detail",
+                error=str(exc),
+            )
             return
 
         self.recorder_thread = RecorderThread(
             self.recording_rect,
             str(output_file),
-            fps
+            profile_key,
         )
-        self.recorder_thread.finished.connect(self.on_recording_finished)
+        self.recorder_thread.completed.connect(self.on_recording_finished)
         self.recorder_thread.error.connect(self.on_recording_error)
         self.recorder_thread.start()
 
@@ -1168,8 +1346,11 @@ class ScreenRecorder(QMainWindow):
 
         self._set_status(
             "recording",
-            "Идёт запись",
-            f"Запись области {self.recording_rect[2]} × {self.recording_rect[3]} px, {fps} FPS.",
+            "status.recording.title",
+            "status.recording.detail",
+            width=self.recording_rect[2],
+            height=self.recording_rect[3],
+            fps=fps,
         )
 
     def toggle_pause(self):
@@ -1181,18 +1362,30 @@ class ScreenRecorder(QMainWindow):
         if self.audio_session is not None:
             self.audio_session.set_paused(self.paused)
         if self.paused:
-            self.pause_btn.setText("Продолжить")
-            self._set_status("paused", "Запись приостановлена", "Нажмите Ctrl+2 или «Продолжить», чтобы продолжить.")
+            self.pause_btn.setText(self._t("button.resume"))
+            self._set_status(
+                "paused",
+                "status.paused.title",
+                "status.paused.detail",
+            )
             debug_print("⏸️ Запись поставлена на паузу")
         else:
-            self.pause_btn.setText("Пауза")
-            self._set_status("recording", "Идёт запись", "Запись продолжается.")
+            self.pause_btn.setText(self._t("button.pause"))
+            self._set_status(
+                "recording",
+                "status.recording.title",
+                "status.resumed.detail",
+            )
             debug_print("▶️ Запись продолжается")
 
     def stop_recording(self):
         if self.recorder_thread and self.recorder_thread.is_recording:
             self.recorder_thread.is_recording = False
-            self._set_status("saving", "Сохранение видео", "Пожалуйста, подождите.")
+            self._set_status(
+                "saving",
+                "status.saving.title",
+                "status.saving.wait",
+            )
             self.pause_btn.setEnabled(False)
             self.stop_btn.setEnabled(False)
             debug_print("⏹️ Остановка записи...")
@@ -1217,9 +1410,13 @@ class ScreenRecorder(QMainWindow):
         self.select_btn.setEnabled(True)
         self.audio_combo.setEnabled(True)
         self.recording_mode_combo.setEnabled(True)
-        self.pause_btn.setText("Пауза")
+        self.pause_btn.setText(self._t("button.pause"))
         self._set_recording_actions(False)
-        self._set_status("saving", "Сохранение видео", "Подготавливаем итоговый MP4.")
+        self._set_status(
+            "saving",
+            "status.saving.title",
+            "status.saving.finalize",
+        )
         self._debug_selection_state("recording finished")
 
         if self.border_window:
@@ -1238,8 +1435,8 @@ class ScreenRecorder(QMainWindow):
         if not self.recorder_thread or not self.recorder_thread.output_path:
             self._set_status(
                 "error",
-                "Ошибка сохранения",
-                "Не найден путь к временному видео.",
+                "status.save_error.title",
+                "status.save_error.no_path",
             )
             self.audio_session = None
             return
@@ -1249,8 +1446,9 @@ class ScreenRecorder(QMainWindow):
         if not raw_path.exists():
             self._set_status(
                 "error",
-                "Ошибка сохранения",
-                f"Не найден временный файл: {raw_path.name}.",
+                "status.save_error.title",
+                "status.save_error.missing_file",
+                filename=raw_path.name,
             )
             debug_print(f"Raw video file not found: {raw_path}")
             self.audio_session = None
@@ -1289,21 +1487,26 @@ class ScreenRecorder(QMainWindow):
             if audio_error is not None:
                 self._set_status(
                     "saved",
-                    "Запись сохранена",
-                    f"{final_path.name} ({size_mb:.1f} МБ) — без звука.",
+                    "status.saved.title",
+                    "status.saved.no_audio",
+                    filename=final_path.name,
+                    size=size_mb,
                 )
             else:
                 self._set_status(
                     "saved",
-                    "Запись сохранена",
-                    f"{final_path.name} ({size_mb:.1f} МБ)",
+                    "status.saved.title",
+                    "status.saved.detail",
+                    filename=final_path.name,
+                    size=size_mb,
                 )
         except (MediaMuxError, OSError) as exc:
             debug_print(f"Recording mux failed: {exc}")
             self._set_status(
                 "error",
-                "Ошибка сохранения",
-                f"{exc}. Временные файлы сохранены.",
+                "status.save_error.title",
+                "status.save_error.preserved",
+                error=str(exc),
             )
         finally:
             self.audio_session = None
@@ -1318,15 +1521,29 @@ class ScreenRecorder(QMainWindow):
         self.audio_combo.setEnabled(True)
         self.recording_mode_combo.setEnabled(True)
         self._set_recording_actions(False)
-        self._set_status("error", "Ошибка записи", error_msg)
+        technical_error = error_msg.removeprefix(
+            "Ошибка при записи видео: "
+        )
+        if technical_error == "Не было захвачено ни одного кадра":
+            detail_key = "status.recording_error.no_frames"
+            detail_values = {}
+        else:
+            detail_key = "status.recording_error.detail"
+            detail_values = {"error": technical_error}
+        self._set_status(
+            "error",
+            "status.recording_error.title",
+            detail_key,
+            **detail_values,
+        )
         self.recorder_thread = None
 
         if self.audio_session is not None:
             try:
                 self.audio_session.stop()
             except AudioCaptureError as exc:
-                debug_print(f"Audio cleanup after video error failed: {exc}")
-            self.audio_session.cleanup()
+                debug_print(f"Audio stop after video error failed: {exc}")
+            debug_print("Temporary audio files preserved after video error")
             self.audio_session = None
 
         if self.border_window:
@@ -1334,7 +1551,7 @@ class ScreenRecorder(QMainWindow):
             self.border_window = None
 
     def show_help(self):
-        self.help_window = HelpWindow()
+        self.help_window = HelpWindow(self._t("help.title"), self)
         self.help_window.exec_()
 
     def open_recordings_folder(self):
@@ -1343,7 +1560,12 @@ class ScreenRecorder(QMainWindow):
         try:
             os.startfile(str(directory))
         except OSError as exc:
-            self._set_status("error", "Не удалось открыть папку", str(exc))
+            self._set_status(
+                "error",
+                "status.folder_error.title",
+                "status.folder_error.detail",
+                error=str(exc),
+            )
 
 
 if __name__ == "__main__":

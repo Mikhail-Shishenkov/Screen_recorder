@@ -98,7 +98,7 @@ def run_mode(
     diagnostics=False,
     tone_microphone=False,
 ):
-    raw_path = output_dir / f"audio_{mode}_raw.mp4"
+    raw_path = output_dir / f"audio_{mode}_video.mkv"
     final_path = output_dir / f"audio_{mode}.mp4"
     audio_prefix = output_dir / f"audio_{mode}"
     session = AudioSession(
@@ -107,7 +107,11 @@ def run_mode(
         logger=print if diagnostics else None,
         diagnostics=diagnostics,
     )
-    recorder = RecorderThread((0, 0, 640, 480), str(raw_path), 15)
+    recorder = RecorderThread(
+        (0, 0, 640, 480),
+        str(raw_path),
+        "tracker",
+    )
     tone = None
 
     session.start()

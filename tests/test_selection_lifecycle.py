@@ -1,13 +1,19 @@
 import os
+import tempfile
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt5.QtCore import QCoreApplication, QEvent
+from PyQt5.QtCore import QCoreApplication, QEvent, QSettings
 from PyQt5.QtWidgets import QApplication
 
 from audio_capture import AudioCaptureError
+from ffmpeg_video_writer import VIDEO_PROFILES
+from localization import translate
+from media_mux import MediaMuxError
 from screen_recorder import RECORDING_MODES, ScreenRecorder, bundled_resource_path
 
 
@@ -24,13 +30,13 @@ class FakeSignal:
 
 
 class FakeRecorderThread:
-    def __init__(self, bbox, output_path, fps):
+    def __init__(self, bbox, output_path, profile_key):
         self.bbox = bbox
         self.output_path = output_path
-        self.fps = fps
+        self.profile_key = profile_key
         self.is_recording = True
         self.is_paused = False
-        self.finished = FakeSignal()
+        self.completed = FakeSignal()
         self.error = FakeSignal()
         self._running = False
 
@@ -43,7 +49,7 @@ class FakeRecorderThread:
     def complete(self):
         self.is_recording = False
         self._running = False
-        self.finished.emit()
+        self.completed.emit()
 
 
 class FakeAudioSession:
@@ -51,6 +57,8 @@ class FakeAudioSession:
         self.fail = fail
         self.started = False
         self.stopped = False
+        self.cleaned = False
+        self.paused_states = []
 
     def start(self):
         if self.fail:
@@ -58,7 +66,7 @@ class FakeAudioSession:
         self.started = True
 
     def set_paused(self, paused):
-        pass
+        self.paused_states.append(paused)
 
     def request_stop(self):
         pass
@@ -68,7 +76,7 @@ class FakeAudioSession:
         return []
 
     def cleanup(self):
-        pass
+        self.cleaned = True
 
 
 class SelectionLifecycleTests(unittest.TestCase):
@@ -83,7 +91,12 @@ class SelectionLifecycleTests(unittest.TestCase):
         self.hotkeys_patcher.start()
         self.mkdir_patcher.start()
         self.worker_patcher.start()
-        self.recorder = ScreenRecorder()
+        self.settings_dir = tempfile.TemporaryDirectory()
+        self.settings = QSettings(
+            str(Path(self.settings_dir.name) / "settings.ini"),
+            QSettings.IniFormat,
+        )
+        self.recorder = ScreenRecorder(settings=self.settings)
         self.recorder.show()
         self.app.processEvents()
 
@@ -97,6 +110,7 @@ class SelectionLifecycleTests(unittest.TestCase):
         self.worker_patcher.stop()
         self.mkdir_patcher.stop()
         self.hotkeys_patcher.stop()
+        self.settings_dir.cleanup()
 
     def finish_selection(self, rect):
         self.recorder.select_btn.click()
@@ -214,7 +228,15 @@ class SelectionLifecycleTests(unittest.TestCase):
         self.assertEqual(
             [self.recorder.recording_mode_combo.itemData(index)
              for index in range(self.recorder.recording_mode_combo.count())],
-            [fps for _, fps in RECORDING_MODES],
+            [profile.key for profile in VIDEO_PROFILES],
+        )
+        self.assertEqual(
+            [self.recorder.recording_mode_combo.itemText(index)
+             for index in range(self.recorder.recording_mode_combo.count())],
+            [
+                translate("ru", translation_key)
+                for translation_key, _ in RECORDING_MODES
+            ],
         )
         self.assertTrue(self.recorder.open_folder_btn.isEnabled())
         self.assertLessEqual(self.recorder.minimumSizeHint().width(), 800)
@@ -237,6 +259,80 @@ class SelectionLifecycleTests(unittest.TestCase):
         worker.complete()
         self.app.processEvents()
         self.assertTrue(self.recorder.recording_mode_combo.isEnabled())
+
+    def test_pause_and_resume_update_video_and_audio_state(self):
+        self.recorder.recording_rect = (10, 20, 100, 100)
+        self.recorder.record_btn.setEnabled(True)
+        session = FakeAudioSession()
+
+        with patch("screen_recorder.AudioSession", return_value=session):
+            self.recorder.record_btn.click()
+
+        worker = self.recorder.recorder_thread
+        self.recorder.pause_btn.click()
+        self.assertTrue(worker.is_paused)
+        self.assertEqual(session.paused_states, [True])
+        self.assertEqual(self.recorder.pause_btn.text(), "Продолжить")
+
+        self.recorder.pause_btn.click()
+        self.assertFalse(worker.is_paused)
+        self.assertEqual(session.paused_states, [True, False])
+        self.assertEqual(self.recorder.pause_btn.text(), "Пауза")
+
+    def test_failed_finalization_preserves_temporary_files(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            raw_path = Path(temp_dir) / "video.mkv"
+            final_path = Path(temp_dir) / "video.mp4"
+            raw_path.write_bytes(b"video")
+            session = FakeAudioSession()
+            self.recorder.audio_session = session
+            self.recorder.recorder_thread = SimpleNamespace(
+                output_path=raw_path,
+                frame_count=15,
+                effective_fps=15,
+                active_recording_seconds=1.0,
+                isRunning=lambda: False,
+            )
+            self.recorder.final_output_path = final_path
+
+            with patch(
+                "screen_recorder.mux_recording",
+                side_effect=MediaMuxError("mux failed"),
+            ):
+                self.recorder.on_recording_finished()
+
+            self.assertTrue(raw_path.exists())
+            self.assertFalse(final_path.exists())
+            self.assertFalse(session.cleaned)
+
+    def test_successful_finalization_removes_current_temporary_files(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            raw_path = Path(temp_dir) / "video.mkv"
+            final_path = Path(temp_dir) / "video.mp4"
+            raw_path.write_bytes(b"video")
+            session = FakeAudioSession()
+            self.recorder.audio_session = session
+            self.recorder.recorder_thread = SimpleNamespace(
+                output_path=raw_path,
+                frame_count=15,
+                effective_fps=15,
+                active_recording_seconds=1.0,
+                isRunning=lambda: False,
+            )
+            self.recorder.final_output_path = final_path
+
+            def fake_mux(*args, **kwargs):
+                final_path.write_bytes(b"mp4")
+
+            with patch(
+                "screen_recorder.mux_recording",
+                side_effect=fake_mux,
+            ):
+                self.recorder.on_recording_finished()
+
+            self.assertFalse(raw_path.exists())
+            self.assertTrue(final_path.exists())
+            self.assertTrue(session.cleaned)
 
     def test_open_recordings_folder_uses_portable_recordings_directory(self):
         with patch("screen_recorder.recordings_directory") as directory_mock, patch(

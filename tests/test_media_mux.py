@@ -69,14 +69,14 @@ class MediaMuxTests(unittest.TestCase):
     def test_video_only_mux_has_no_audio_output(self):
         command = build_mux_command(
             "ffmpeg.exe",
-            "raw.mp4",
+            "raw.mkv",
             "final.mp4",
             [],
         )
 
         self.assertIn("-an", command)
-        self.assertIn("libx264", command)
-        self.assertIn("yuv420p", command)
+        self.assertEqual(command[command.index("-c:v") + 1], "copy")
+        self.assertNotIn("libx264", command)
         self.assertIn("+faststart", command)
         self.assertNotIn("aac", command)
 
@@ -84,7 +84,7 @@ class MediaMuxTests(unittest.TestCase):
         track = make_track(AUDIO_MICROPHONE, Path("microphone.wav"))
         command = build_mux_command(
             "ffmpeg.exe",
-            "raw.mp4",
+            "raw.mkv",
             "final.mp4",
             [track],
             output_duration=1.25,
@@ -96,6 +96,7 @@ class MediaMuxTests(unittest.TestCase):
         self.assertIn("2", command)
         self.assertIn("-shortest", command)
         self.assertIn("+faststart", command)
+        self.assertEqual(command[command.index("-c:v") + 1], "copy")
         self.assertEqual(command[command.index("-t") + 1], "1.250000")
         filter_graph = command[command.index("-filter_complex") + 1]
         self.assertIn("aresample=48000", filter_graph)
@@ -109,7 +110,7 @@ class MediaMuxTests(unittest.TestCase):
         ]
         command = build_mux_command(
             "ffmpeg.exe",
-            "raw.mp4",
+            "raw.mkv",
             "final.mp4",
             tracks,
         )
@@ -125,7 +126,7 @@ class MediaMuxTests(unittest.TestCase):
 
     def test_mux_invokes_ffmpeg_and_requires_output_file(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            raw_path = Path(temp_dir) / "raw.mp4"
+            raw_path = Path(temp_dir) / "raw.mkv"
             final_path = Path(temp_dir) / "final.mp4"
             raw_path.write_bytes(b"raw")
 
