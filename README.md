@@ -144,6 +144,4 @@ benchmarks/                  локальные диагностические �
 screen_recorder.spec         актуальная конфигурация PyInstaller
 requirements.txt             runtime-зависимости
 requirements-dev.txt         инструменты сборки
-THIRD_PARTY_NOTICES.txt      сведения о сторонних компонентах
-FFMPEG-LICENSE.txt           лицензия комплектного FFmpeg
 ```
