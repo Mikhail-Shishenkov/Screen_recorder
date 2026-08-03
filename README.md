@@ -3,7 +3,7 @@
 Windows-приложение для записи выбранной области экрана в MP4/H.264 с системным
 звуком, микрофоном, курсором и отображением кликов.
 
-![Главное окно Screen Recorder Pro](docs/screenshots/screen-recorder.png)
+![Главное окно Screen Recorder Pro](docs/screenshots/screen-recorder.jpg)
 
 ## Возможности
 
